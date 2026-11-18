@@ -32,6 +32,7 @@ import android.os.HandlerThread
 import android.os.SystemClock
 import android.util.Log
 import com.meta.wearable.dat.camera.types.VideoFrame
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.debug.DebugLog
 import java.io.ByteArrayOutputStream
 
 class GlassesFrameDecoder(
@@ -55,6 +56,8 @@ class GlassesFrameDecoder(
   private val pendingConfig = mutableListOf<ByteArray>()
 
   @Volatile private var lastEmitMs = 0L
+  @Volatile private var firstPictureLogged = false
+  @Volatile private var failureCount = 0
 
   /** Feed one frame from Stream.videoStream. Called on a single background thread. */
   fun decode(frame: VideoFrame) {
@@ -92,7 +95,7 @@ class GlassesFrameDecoder(
   }
 
   private fun setupLocked(width: Int, height: Int) {
-    Log.d(TAG, "Starting HEVC decode at ${width}x$height")
+    DebugLog.log("DECODER", "starting HEVC decode at ${width}x$height")
     val thread = HandlerThread("GlassesFrameReader").apply { start() }
     readerThread = thread
     val reader = ImageReader.newInstance(width, height, ImageFormat.YUV_420_888, MAX_IMAGES)
@@ -134,9 +137,16 @@ class GlassesFrameDecoder(
       if (now - lastEmitMs < minIntervalMs) return
       lastEmitMs = now
       val bitmap = imageToBitmap(image) ?: return
+      if (!firstPictureLogged) {
+        firstPictureLogged = true
+        DebugLog.log("DECODER", "first picture decoded (${bitmap.width}x${bitmap.height})")
+      }
       onBitmap(bitmap)
     } catch (e: Exception) {
-      Log.w(TAG, "Frame conversion failed", e)
+      failureCount++
+      if (failureCount <= 3) {
+        DebugLog.log("DECODER", "picture conversion failed #$failureCount: ${e.javaClass.simpleName}: ${e.message}")
+      }
     } finally {
       image.close()
     }

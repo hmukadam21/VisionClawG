@@ -13,6 +13,7 @@ package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 import android.graphics.Bitmap
 import android.util.Base64
 import android.util.Log
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.debug.DebugLog
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.GeminiToolCall
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.GeminiToolCallCancellation
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.ToolDeclarations
@@ -77,6 +78,10 @@ class GeminiLiveService {
     val hasResumptionHandle: Boolean
         get() = resumptionHandle != null
 
+    // Diagnostics: log the first resumption update and each unknown message type once
+    @Volatile private var resumptionLogged = false
+    private val loggedUnknownKeys = mutableSetOf<String>()
+
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .pingInterval(10, TimeUnit.SECONDS)
@@ -97,6 +102,7 @@ class GeminiLiveService {
 
         _connectionState.value = GeminiConnectionState.Connecting
         connectCallback = callback
+        DebugLog.log("GEMINI", "connecting (model ${GeminiConfig.MODEL}, resume=${resumptionHandle != null})")
 
         val request = Request.Builder().url(url).build()
         val socket = client.newWebSocket(request, object : WebSocketListener() {
@@ -105,7 +111,7 @@ class GeminiLiveService {
 
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 if (!isCurrent(webSocket)) return
-                Log.d(TAG, "WebSocket opened (resuming: ${resumptionHandle != null})")
+                DebugLog.log("GEMINI", "socket open, sending setup")
                 _connectionState.value = GeminiConnectionState.SettingUp
                 sendSetupMessage(webSocket)
             }
@@ -123,7 +129,12 @@ class GeminiLiveService {
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 if (!isCurrent(webSocket)) return
                 val msg = t.message ?: "Unknown error"
-                Log.e(TAG, "WebSocket failure: $msg")
+                DebugLog.log(
+                    "GEMINI",
+                    "socket FAILURE: ${t.javaClass.simpleName}: $msg" +
+                        (response?.let { " (HTTP ${it.code} ${it.message})" } ?: "") +
+                        " while ${if (connectCallback != null) "connecting" else "connected"}",
+                )
                 _connectionState.value = GeminiConnectionState.Error(msg)
                 _isModelSpeaking.value = false
                 val wasConnecting = connectCallback != null
@@ -134,8 +145,11 @@ class GeminiLiveService {
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 if (!isCurrent(webSocket)) return
-                Log.d(TAG, "WebSocket closing: $code $reason")
                 val wasConnecting = connectCallback != null
+                DebugLog.log(
+                    "GEMINI",
+                    "server closing connection: code $code, reason '$reason' while ${if (wasConnecting) "connecting" else "connected"}",
+                )
                 // While connecting, keep Gemini's reason visible (e.g. a rejected setup field)
                 _connectionState.value =
                     if (wasConnecting) GeminiConnectionState.Error("Gemini closed the connection ($code): $reason")
@@ -162,7 +176,7 @@ class GeminiLiveService {
                     if (webSocket !== socket) return
                     if (_connectionState.value == GeminiConnectionState.Connecting
                         || _connectionState.value == GeminiConnectionState.SettingUp) {
-                        Log.e(TAG, "Connection timed out")
+                        DebugLog.log("GEMINI", "connect TIMED OUT after ${CONNECT_TIMEOUT_MS / 1000} s")
                         _connectionState.value = GeminiConnectionState.Error("Connection timed out")
                         resolveConnect(false)
                     }
@@ -191,7 +205,11 @@ class GeminiLiveService {
     }
 
     fun sendAudio(data: ByteArray) {
-        if (_connectionState.value != GeminiConnectionState.Ready) return
+        if (_connectionState.value != GeminiConnectionState.Ready) {
+            DebugLog.audioDroppedNotReady.incrementAndGet()
+            return
+        }
+        DebugLog.audioSentToGemini.incrementAndGet()
         sendExecutor.execute {
             val base64 = Base64.encodeToString(data, Base64.NO_WRAP)
             val json = JSONObject().apply {
@@ -208,6 +226,7 @@ class GeminiLiveService {
 
     fun sendVideoFrame(bitmap: Bitmap) {
         if (_connectionState.value != GeminiConnectionState.Ready) return
+        DebugLog.picturesSentToGemini.incrementAndGet()
         sendExecutor.execute {
             val baos = ByteArrayOutputStream()
             bitmap.compress(Bitmap.CompressFormat.JPEG, GeminiConfig.VIDEO_JPEG_QUALITY, baos)
@@ -307,6 +326,7 @@ class GeminiLiveService {
 
             // Setup complete
             if (json.has("setupComplete")) {
+                DebugLog.log("GEMINI", "READY (setup complete)")
                 _connectionState.value = GeminiConnectionState.Ready
                 resolveConnect(true)
                 return
@@ -318,6 +338,10 @@ class GeminiLiveService {
                 val handle = update.optString("newHandle", "")
                 if (update.optBoolean("resumable", false) && handle.isNotEmpty()) {
                     resumptionHandle = handle
+                    if (!resumptionLogged) {
+                        resumptionLogged = true
+                        DebugLog.log("GEMINI", "session resumption is working (first handle received)")
+                    }
                 }
                 if (json.length() == 1) return
             }
@@ -326,7 +350,7 @@ class GeminiLiveService {
             if (json.has("goAway")) {
                 val goAway = json.getJSONObject("goAway")
                 val timeLeft = goAway.opt("timeLeft")?.toString() ?: "?"
-                Log.d(TAG, "goAway received (time left: $timeLeft)")
+                DebugLog.log("GEMINI", "goAway from server (time left: $timeLeft), reconnecting")
                 _connectionState.value = GeminiConnectionState.Disconnected
                 _isModelSpeaking.value = false
                 onDisconnected?.invoke("goAway")
@@ -380,6 +404,7 @@ class GeminiLiveService {
                                                 responseLatencyLogged = true
                                             }
                                         }
+                                        DebugLog.audioFromGemini.incrementAndGet()
                                         onAudioReceived?.invoke(audioData)
                                     }
                                 }
@@ -416,8 +441,15 @@ class GeminiLiveService {
                     }
                 }
             }
+            // Anything else: note each new kind of message once (helps spot server errors)
+            val keys = json.keys().asSequence().filter { it != "usageMetadata" && it != "sessionResumptionUpdate" }.toList()
+            for (key in keys) {
+                if (key != "serverContent" && loggedUnknownKeys.add(key)) {
+                    DebugLog.log("GEMINI", "unhandled message type '$key': ${json.opt(key).toString().take(300)}")
+                }
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "Error parsing message: ${e.message}")
+            DebugLog.log("GEMINI", "could not read a server message: ${e.message}")
         }
     }
 }

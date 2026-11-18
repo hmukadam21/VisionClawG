@@ -15,6 +15,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.MainActivity
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.R
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.debug.DebugLog
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -66,19 +67,20 @@ class StreamingService : Service() {
 
   override fun onCreate() {
     super.onCreate()
-    Log.d(TAG, "Service created")
+    DebugLog.init(this)
+    DebugLog.log("SERVICE", "created")
     createNotificationChannel()
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     if (intent?.action == ACTION_STOP) {
-      Log.d(TAG, "Stop tapped in notification")
+      DebugLog.log("SERVICE", "Stop tapped in notification")
       _stopRequests.tryEmit(Unit)
       stopSelf()
       return START_NOT_STICKY
     }
 
-    Log.d(TAG, "Service started")
+    DebugLog.log("SERVICE", "started")
     val notification = createNotification()
     try {
       startForeground(
@@ -89,7 +91,7 @@ class StreamingService : Service() {
       )
     } catch (e: Exception) {
       // E.g. microphone permission missing: keep at least the glasses connection alive.
-      Log.w(TAG, "Foreground with microphone type refused, retrying without it", e)
+      DebugLog.log("SERVICE", "microphone foreground type REFUSED (${e.javaClass.simpleName}: ${e.message}); running without it, mic may be muted when locked")
       startForeground(
           NOTIFICATION_ID,
           notification,
@@ -104,7 +106,7 @@ class StreamingService : Service() {
   }
 
   override fun onDestroy() {
-    Log.d(TAG, "Service destroyed")
+    DebugLog.log("SERVICE", "destroyed")
     releaseWakeLock()
     super.onDestroy()
   }

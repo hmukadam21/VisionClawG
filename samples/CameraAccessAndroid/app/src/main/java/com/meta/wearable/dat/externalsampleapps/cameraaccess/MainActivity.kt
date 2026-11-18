@@ -25,6 +25,7 @@ import androidx.activity.viewModels
 import com.meta.wearable.dat.core.Wearables
 import com.meta.wearable.dat.core.types.Permission
 import com.meta.wearable.dat.core.types.PermissionStatus
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.debug.DebugLog
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.SettingsManager
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.ui.CameraAccessScaffold
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.wearables.WearablesViewModel
@@ -76,6 +77,9 @@ class MainActivity : ComponentActivity() {
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+    DebugLog.init(this)
+    DebugLog.installCrashHandler()
+    DebugLog.log("APP", "activity created")
     enableEdgeToEdge()
 
     // Initialize settings with app context
@@ -99,6 +103,21 @@ class MainActivity : ComponentActivity() {
           onRequestWearablesPermission = ::requestWearablesPermission,
       )
     }
+  }
+
+  override fun onStart() {
+    super.onStart()
+    DebugLog.log("APP", "app on screen")
+  }
+
+  override fun onStop() {
+    DebugLog.log("APP", "app left the screen (background or phone locked)")
+    super.onStop()
+  }
+
+  override fun onDestroy() {
+    DebugLog.log("APP", "activity destroyed (finishing=$isFinishing)")
+    super.onDestroy()
   }
 
   fun checkPermissions(onPermissionsGranted: () -> Unit) {

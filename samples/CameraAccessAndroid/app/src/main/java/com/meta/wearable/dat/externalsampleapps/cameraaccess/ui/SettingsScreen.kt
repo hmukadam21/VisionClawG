@@ -1,6 +1,9 @@
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.ui
 
+import android.content.Intent
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.core.content.FileProvider
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -32,9 +35,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.debug.DebugLog
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.SettingsManager
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -53,6 +58,7 @@ fun SettingsScreen(
     var videoStreamingEnabled by remember { mutableStateOf(SettingsManager.videoStreamingEnabled) }
     var proactiveNotificationsEnabled by remember { mutableStateOf(SettingsManager.proactiveNotificationsEnabled) }
     var showResetDialog by remember { mutableStateOf(false) }
+    val context = LocalContext.current
 
     fun save() {
         SettingsManager.geminiAPIKey = geminiAPIKey.trim()
@@ -202,6 +208,26 @@ fun SettingsScreen(
                     checked = proactiveNotificationsEnabled,
                     onCheckedChange = { proactiveNotificationsEnabled = it },
                 )
+            }
+
+            // Diagnostics: share the on-phone log (no keys or spoken words are in it)
+            SectionHeader("Diagnostics")
+            TextButton(onClick = {
+                val file = DebugLog.exportForSharing(context)
+                if (file == null) {
+                    Toast.makeText(context, "Could not prepare the log", Toast.LENGTH_SHORT).show()
+                } else {
+                    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+                    val send = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        putExtra(Intent.EXTRA_SUBJECT, "VisionClaw diagnostic log")
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    context.startActivity(Intent.createChooser(send, "Share diagnostic log"))
+                }
+            }) {
+                Text("Share diagnostic log")
             }
 
             // Reset

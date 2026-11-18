@@ -50,6 +50,7 @@ import com.meta.wearable.dat.core.Wearables
 import com.meta.wearable.dat.core.selectors.DeviceSelector
 import com.meta.wearable.dat.core.session.DeviceSession
 import com.meta.wearable.dat.core.session.DeviceSessionState
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.debug.DebugLog
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini.GeminiSessionViewModel
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.phone.PhoneCameraManager
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.wearables.WearablesViewModel
@@ -61,6 +62,7 @@ import java.io.FileOutputStream
 import java.io.IOException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -114,24 +116,44 @@ class StreamViewModel(
   var webrtcViewModel: WebRTCSessionViewModel? = null
   private var phoneCameraManager: PhoneCameraManager? = null
 
+  private var heartbeatJob: Job? = null
+
   init {
     // "Stop" tapped in the notification: end Gemini, the live share and the glasses stream.
     viewModelScope.launch {
       StreamingService.stopRequests.collect {
-        Log.d(TAG, "Stop requested from notification")
-        geminiViewModel?.stopSession()
+        DebugLog.log("STREAM", "Stop requested from notification")
+        geminiViewModel?.stopSession("notification Stop")
         webrtcViewModel?.stopSession()
-        stopStream()
+        stopStream("notification Stop")
         wearablesViewModel.navigateToDeviceSelection()
       }
     }
   }
 
+  // Every 30 s: how much flowed through each link since the last line (see DebugLog).
+  private fun startHeartbeat() {
+    heartbeatJob?.cancel()
+    heartbeatJob =
+        viewModelScope.launch {
+          while (true) {
+            delay(30_000)
+            val gemini = geminiViewModel?.uiState?.value
+            DebugLog.heartbeat(
+                "stream=${_uiState.value.streamSessionState} mode=${_uiState.value.streamingMode} " +
+                    "geminiActive=${gemini?.isGeminiActive} gemini=${gemini?.connectionState}"
+            )
+          }
+        }
+  }
+
   // MARK: - Glasses streaming
 
   fun startStream() {
-    stopStream()
+    stopStream("starting a new stream")
     stopping = false
+    DebugLog.log("STREAM", "starting glasses session")
+    startHeartbeat()
 
     // Foreground service keeps glasses link + microphone alive while the screen is off
     StreamingService.start(getApplication())
@@ -147,7 +169,7 @@ class StreamViewModel(
           created.start()
         }
         .onFailure { error, _ ->
-          Log.e(TAG, "createSession failed: ${error.description}")
+          DebugLog.log("STREAM", "createSession FAILED: ${error.description}")
           failAndLeave("Could not connect to the glasses: ${error.description}")
         }
   }
@@ -156,12 +178,12 @@ class StreamViewModel(
     sessionStateJob =
         viewModelScope.launch {
           currentSession.state.collect { state ->
-            Log.d(TAG, "session state: $state")
+            DebugLog.log("STREAM", "glasses session state: $state")
             when (state) {
               // A camera can only be added once the session is STARTED
               DeviceSessionState.STARTED -> attachCamera(currentSession)
               // STOPPED is terminal (the glasses were removed, folded, disconnected, ...)
-              DeviceSessionState.STOPPED -> if (!stopping) leaveStreaming()
+              DeviceSessionState.STOPPED -> if (!stopping) leaveStreaming("glasses session stopped")
               else -> Unit
             }
           }
@@ -169,7 +191,7 @@ class StreamViewModel(
     sessionErrorJob =
         viewModelScope.launch {
           currentSession.errors.collect { error ->
-            Log.e(TAG, "session error: ${error.description}")
+            DebugLog.log("STREAM", "glasses session error: ${error.description}")
             wearablesViewModel.setRecentError(error.description)
           }
         }
@@ -177,6 +199,7 @@ class StreamViewModel(
 
   private fun attachCamera(currentSession: DeviceSession) {
     if (camera != null) return
+    DebugLog.log("STREAM", "adding camera (compressed HEVC, MEDIUM, $FRAME_RATE fps)")
     frameDecoder?.release()
     frameDecoder = GlassesFrameDecoder(PICTURE_INTERVAL_MS) { bitmap -> onPicture(bitmap) }
     currentSession
@@ -195,12 +218,12 @@ class StreamViewModel(
           // Subscribe before start() so no state change is missed
           observeStream(addedStream)
           addedStream.start().onFailure { error, _ ->
-            Log.e(TAG, "stream start failed: ${error.description}")
+            DebugLog.log("STREAM", "stream start FAILED: ${error.description}")
             failAndLeave("Could not start the glasses camera: ${error.description}")
           }
         }
         .onFailure { error, _ ->
-          Log.e(TAG, "addCamera failed: ${error.description}")
+          DebugLog.log("STREAM", "addCamera FAILED: ${error.description}")
           failAndLeave("Could not open the glasses camera: ${error.description}")
         }
   }
@@ -216,34 +239,34 @@ class StreamViewModel(
           // CLOSED that comes after an active state means the stream really ended.
           var hasBeenActive = false
           currentStream.state.collect { state ->
-            Log.d(TAG, "stream state: $state")
+            DebugLog.log("STREAM", "video stream state: $state")
             val isTerminal = state == StreamState.STOPPED || state == StreamState.CLOSED
             if (!isTerminal) {
               hasBeenActive = true
               _uiState.update { it.copy(streamSessionState = state) }
             } else if (hasBeenActive) {
               hasBeenActive = false
-              if (!stopping) leaveStreaming()
+              if (!stopping) leaveStreaming("video stream ended ($state)")
             }
           }
         }
     streamErrorJob =
         viewModelScope.launch {
           currentStream.errorStream.collect { error ->
-            Log.e(TAG, "stream error: ${error.description}")
+            DebugLog.log("STREAM", "video stream error: ${error.description}")
             wearablesViewModel.setRecentError(error.description)
           }
         }
   }
 
-  private fun leaveStreaming() {
-    stopStream()
+  private fun leaveStreaming(reason: String) {
+    stopStream(reason)
     wearablesViewModel.navigateToDeviceSelection()
   }
 
   private fun failAndLeave(message: String) {
     wearablesViewModel.setRecentError(message)
-    leaveStreaming()
+    leaveStreaming(message)
   }
 
   // MARK: - Phone camera mode (unchanged)
@@ -267,13 +290,17 @@ class StreamViewModel(
       )
     }
     manager.start(lifecycleOwner)
-    Log.d(TAG, "Phone camera mode started")
+    DebugLog.log("STREAM", "phone camera mode started")
+    startHeartbeat()
   }
 
   // MARK: - Stop
 
-  fun stopStream() {
+  fun stopStream(reason: String = "Stop button / screen closed") {
+    if (session != null || phoneCameraManager != null) DebugLog.log("STREAM", "stopping: $reason")
     stopping = true
+    heartbeatJob?.cancel()
+    heartbeatJob = null
 
     // Stop foreground service
     StreamingService.stop(getApplication())
@@ -381,6 +408,7 @@ class StreamViewModel(
   // MARK: - Frames
 
   private fun handleVideoFrame(videoFrame: VideoFrame) {
+    DebugLog.glassesFrames.incrementAndGet()
     if (videoFrame.isCompressed) {
       // Normal path: HEVC -> decoder -> onPicture()
       frameDecoder?.decode(videoFrame)
@@ -392,6 +420,7 @@ class StreamViewModel(
 
   /** A decoded picture from the glasses (called on the decoder's thread). */
   private fun onPicture(bitmap: Bitmap) {
+    DebugLog.pictures.incrementAndGet()
     _uiState.update { it.copy(videoFrame = bitmap) }
     // Forward to Gemini (throttled to ~1 per second inside the VM)
     geminiViewModel?.sendVideoFrameIfThrottled(bitmap)

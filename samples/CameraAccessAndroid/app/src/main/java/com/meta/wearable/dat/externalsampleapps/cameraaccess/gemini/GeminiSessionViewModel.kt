@@ -13,6 +13,7 @@ import android.graphics.Bitmap
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.debug.DebugLog
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawBridge
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawConnectionState
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawEventClient
@@ -77,6 +78,7 @@ class GeminiSessionViewModel : ViewModel() {
             return
         }
 
+        DebugLog.log("AI", "AI started (new conversation, mode $streamingMode)")
         sessionWanted = true
         micStarted = false
         reconnecting = false
@@ -86,6 +88,7 @@ class GeminiSessionViewModel : ViewModel() {
 
         // Wire audio callbacks
         audioManager.onAudioCaptured = lambda@{ data ->
+            DebugLog.micChunks.incrementAndGet()
             // Phone mode: mute mic while model speaks to prevent echo
             if (streamingMode == StreamingMode.PHONE && geminiService.isModelSpeaking.value) return@lambda
             geminiService.sendAudio(data)
@@ -152,7 +155,7 @@ class GeminiSessionViewModel : ViewModel() {
                             is GeminiConnectionState.Error -> state.message
                             else -> "Failed to connect to Gemini"
                         }
-                        stopSession()
+                        stopSession("first connect failed: $msg")
                         _uiState.value = _uiState.value.copy(errorMessage = msg)
                         return@launch
                     }
@@ -181,8 +184,9 @@ class GeminiSessionViewModel : ViewModel() {
         try {
             audioManager.startCapture()
             micStarted = true
+            DebugLog.log("AI", "microphone started")
         } catch (e: Exception) {
-            stopSession()
+            stopSession("mic failed: ${e.message}")
             _uiState.value = _uiState.value.copy(errorMessage = "Mic capture failed: ${e.message}")
             return
         }
@@ -200,6 +204,7 @@ class GeminiSessionViewModel : ViewModel() {
     }
 
     private fun onConnectionLost(reason: String) {
+        DebugLog.log("AI", "connection lost: $reason (wanted=$sessionWanted, alreadyReconnecting=$reconnecting)")
         if (!sessionWanted || reconnecting) return
         scheduleReconnect(reason)
     }
@@ -207,8 +212,8 @@ class GeminiSessionViewModel : ViewModel() {
     private fun scheduleReconnect(reason: String) {
         if (!sessionWanted) return
         if (reconnectAttempts >= RECONNECT_DELAYS_MS.size) {
-            Log.e(TAG, "Giving up after $reconnectAttempts reconnect attempts ($reason)")
-            stopSession()
+            DebugLog.log("AI", "GIVING UP after $reconnectAttempts reconnect attempts (last: $reason)")
+            stopSession("gave up reconnecting")
             _uiState.value = _uiState.value.copy(errorMessage = "Connection lost: $reason")
             return
         }
@@ -216,7 +221,7 @@ class GeminiSessionViewModel : ViewModel() {
         // goAway is planned: reconnect at once. Other drops: back off a little more each time.
         val delayMs = if (reason == "goAway") 0L else RECONNECT_DELAYS_MS[reconnectAttempts]
         reconnectAttempts++
-        Log.d(TAG, "Reconnecting in ${delayMs}ms (attempt $reconnectAttempts, reason: $reason)")
+        DebugLog.log("AI", "reconnect attempt $reconnectAttempts in ${delayMs} ms (reason: $reason)")
 
         reconnectJob?.cancel()
         reconnectJob = viewModelScope.launch {
@@ -228,12 +233,13 @@ class GeminiSessionViewModel : ViewModel() {
                 viewModelScope.launch {
                     if (!sessionWanted) return@launch
                     if (ok) {
-                        Log.d(TAG, "Reconnected (resumed: ${geminiService.hasResumptionHandle})")
+                        DebugLog.log("AI", "reconnected (same conversation: ${geminiService.hasResumptionHandle})")
                         reconnectAttempts = 0
                         reconnecting = false
                         startMicAndEvents()
                     } else {
                         // The stored handle may have expired: the next try starts fresh.
+                        DebugLog.log("AI", "reconnect attempt failed: ${geminiService.connectionState.value}")
                         geminiService.clearResumption()
                         reconnecting = false
                         scheduleReconnect("retry failed")
@@ -243,7 +249,8 @@ class GeminiSessionViewModel : ViewModel() {
         }
     }
 
-    fun stopSession() {
+    fun stopSession(reason: String = "AI button / screen closed") {
+        if (sessionWanted) DebugLog.log("AI", "AI stopped: $reason")
         sessionWanted = false
         reconnectJob?.cancel()
         reconnectJob = null
