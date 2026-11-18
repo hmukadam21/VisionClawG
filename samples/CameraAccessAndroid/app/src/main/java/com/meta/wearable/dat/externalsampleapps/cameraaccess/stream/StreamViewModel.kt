@@ -75,7 +75,9 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -152,6 +154,8 @@ class StreamViewModel(
   // On-demand look: one at a time; the previous camera is fully off before the next one
   private val lookMutex = Mutex()
   @Volatile private var lookCamera: Camera? = null
+  // Kept from when the camera was added: after camera.stop() the SDK throws on camera.stream
+  @Volatile private var lookCameraStream: Stream? = null
   @Volatile private var lookDecoder: GlassesFrameDecoder? = null
   @Volatile private var lastLookFrame: Bitmap? = null
   private val lookCameraJobs = mutableListOf<Job>()
@@ -529,12 +533,19 @@ class StreamViewModel(
         DebugLog.looks.incrementAndGet()
         // The previous look's camera must be fully off before a new one is added
         lookTeardownJob?.join()
-        when {
-          _uiState.value.streamingMode == StreamingMode.PHONE ->
-              _uiState.value.videoFrame?.let { LookResult.Photo(it) }
-                  ?: LookResult.Failed("no picture from the phone camera yet")
-          !onDemand -> liveLook()
-          else -> onDemandLook()
+        try {
+          when {
+            _uiState.value.streamingMode == StreamingMode.PHONE ->
+                _uiState.value.videoFrame?.let { LookResult.Photo(it) }
+                    ?: LookResult.Failed("no picture from the phone camera yet")
+            !onDemand -> liveLook()
+            else -> onDemandLook()
+          }
+        } catch (e: CancellationException) {
+          throw e
+        } catch (e: Exception) {
+          DebugLog.log("LOOK", "look error: ${e.javaClass.simpleName}: ${e.message}")
+          LookResult.Failed("the glasses camera had an error")
         }
       }
 
@@ -635,6 +646,7 @@ class StreamViewModel(
     }
     lookCamera = cam
     val lookStream = cam.stream
+    lookCameraStream = lookStream
 
     lastLookFrame = null
     val decoder = GlassesFrameDecoder(PICTURE_INTERVAL_MS) { bitmap ->
@@ -718,27 +730,43 @@ class StreamViewModel(
     return bitmap
   }
 
-  /** Stops the look camera and waits until it is really off (so the next addCamera works). */
+  /**
+   * Stops the look camera and waits until it is really off (so the next addCamera works).
+   * v1.6.1: uses the stream kept from startLookCamera. Asking the camera for its stream after
+   * stop() throws in the SDK, which crashed v1.6 right after every on-demand photo.
+   */
   private suspend fun switchOffLookCamera() {
     val cam = lookCamera ?: return
+    val camStream = lookCameraStream
     val startedAt = SystemClock.elapsedRealtime()
-    val stopped =
-        viewModelScope.async {
-          cam.stream.state.first { it == StreamState.STOPPED || it == StreamState.CLOSED }
-        }
-    val off =
-        try {
-          runCatching { cam.stop() }.onFailure { Log.w(TAG, "look camera stop failed", it) }
-          withTimeoutOrNull(CAMERA_STOP_TIMEOUT_MS) { stopped.await() }
-        } finally {
-          stopped.cancel()
-          releaseLookCamera()
-        }
-    DebugLog.log(
-        "LOOK",
-        "camera off after ${SystemClock.elapsedRealtime() - startedAt} ms" +
-            if (off == null) " (did not confirm, closed anyway)" else "",
-    )
+    try {
+      // Watch for the end first (UNDISPATCHED = subscribed now, before stop() below)
+      val stopped =
+          camStream?.let { s ->
+            viewModelScope.async(start = CoroutineStart.UNDISPATCHED) {
+              s.state.first { it == StreamState.STOPPED || it == StreamState.CLOSED }
+            }
+          }
+      val off =
+          try {
+            runCatching { cam.stop() }.onFailure { Log.w(TAG, "look camera stop failed", it) }
+            stopped?.let { withTimeoutOrNull(CAMERA_STOP_TIMEOUT_MS) { it.await() } }
+          } finally {
+            stopped?.cancel()
+          }
+      DebugLog.log(
+          "LOOK",
+          "camera off after ${SystemClock.elapsedRealtime() - startedAt} ms" +
+              if (off == null) " (did not confirm, closed anyway)" else "",
+      )
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Exception) {
+      // Never let switching the camera off take the app down
+      DebugLog.log("LOOK", "camera switch-off problem: ${e.javaClass.simpleName}: ${e.message}")
+    } finally {
+      releaseLookCamera()
+    }
     if (onDemand && session != null) {
       _uiState.update { it.copy(streamSessionState = StreamState.STOPPED) }
     }
@@ -748,6 +776,7 @@ class StreamViewModel(
   private fun releaseLookCamera() {
     val cam = lookCamera
     lookCamera = null
+    lookCameraStream = null
     synchronized(lookCameraJobs) {
       lookCameraJobs.forEach { it.cancel() }
       lookCameraJobs.clear()

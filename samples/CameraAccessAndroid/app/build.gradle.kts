@@ -40,8 +40,8 @@ android {
     minSdk = 31
     // Kept at 34 so Android behaviour of the app does not change in this upgrade.
     targetSdk = 34
-    versionCode = 8
-    versionName = "1.6-look"
+    versionCode = 9
+    versionName = "1.6.1-look"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     vectorDrawables { useSupportLibrary = true }

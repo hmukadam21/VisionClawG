@@ -251,7 +251,14 @@ class GeminiSessionViewModel : ViewModel() {
                 ?: LookResult.Failed("the glasses camera is not connected")
             val toolResult = when (result) {
                 is LookResult.Photo -> {
-                    val sent = withContext(Dispatchers.Default) { geminiService.sendPhoto(result.bitmap) }
+                    val sent = try {
+                        withContext(Dispatchers.Default) { geminiService.sendPhoto(result.bitmap) }
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        DebugLog.log("LOOK", "could not prepare the photo: ${e.javaClass.simpleName}: ${e.message}")
+                        null
+                    }
                     if (sent != null) {
                         DebugLog.log("LOOK", "photo sent to Gemini: $sent")
                         ToolResult.Success(
