@@ -6,13 +6,18 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-// WearablesViewModel - Core DAT SDK Integration
+// WearablesViewModel - Core DAT SDK Integration (DAT SDK 1.0.1)
 //
-// This ViewModel demonstrates the core DAT API patterns for:
-// - Device registration and unregistration using the DAT SDK
-// - Permission management for wearable devices
-// - Device discovery and state management
-// - Integration with MockDeviceKit for testing
+// Handles, using the DAT SDK:
+// - Device registration and unregistration (through the Meta AI app)
+// - Camera permission for the glasses
+// - Device discovery and the active device
+// - Navigation between the home, device and streaming screens
+//
+// Changes from the SDK 0.4.0 version:
+// - RegistrationState is an enum (REGISTERED / REGISTERING / ...)
+// - DeviceSelector.activeDeviceFlow() replaces activeDevice(Wearables.devices)
+// - MockDeviceKit (pretend glasses for testing) is not used in this build
 
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.wearables
 
@@ -23,11 +28,11 @@ import androidx.lifecycle.viewModelScope
 import com.meta.wearable.dat.core.Wearables
 import com.meta.wearable.dat.core.selectors.AutoDeviceSelector
 import com.meta.wearable.dat.core.selectors.DeviceSelector
+import com.meta.wearable.dat.core.types.DeviceCompatibility
 import com.meta.wearable.dat.core.types.DeviceIdentifier
 import com.meta.wearable.dat.core.types.Permission
 import com.meta.wearable.dat.core.types.PermissionStatus
 import com.meta.wearable.dat.core.types.RegistrationState
-import com.meta.wearable.dat.mockdevice.MockDeviceKit
 import kotlinx.collections.immutable.toImmutableList
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -45,7 +50,7 @@ class WearablesViewModel(application: Application) : AndroidViewModel(applicatio
   val uiState: StateFlow<WearablesUiState> = _uiState.asStateFlow()
 
   // AutoDeviceSelector automatically selects the first available wearable device
-  val deviceSelector: DeviceSelector = AutoDeviceSelector()
+  val deviceSelector: DeviceSelector by lazy { AutoDeviceSelector() }
   private var deviceSelectorJob: Job? = null
 
   private var monitoringStarted = false
@@ -57,32 +62,31 @@ class WearablesViewModel(application: Application) : AndroidViewModel(applicatio
     }
     monitoringStarted = true
 
-    // Monitor device selector for active device
+    // Monitor device selector for the active device
     deviceSelectorJob =
         viewModelScope.launch {
-          deviceSelector.activeDevice(Wearables.devices).collect { device ->
+          deviceSelector.activeDeviceFlow().collect { device ->
             _uiState.update { it.copy(hasActiveDevice = device != null) }
           }
         }
 
-    // This allows the app to react to registration changes (registered, unregistered, etc.)
+    // React to registration changes (registered, unregistered, etc.)
     viewModelScope.launch {
       Wearables.registrationState.collect { value ->
         val previousState = _uiState.value.registrationState
         val showGettingStartedSheet =
-            value is RegistrationState.Registered && previousState is RegistrationState.Registering
+            value == RegistrationState.REGISTERED &&
+                previousState == RegistrationState.REGISTERING
         _uiState.update {
           it.copy(registrationState = value, isGettingStartedSheetVisible = showGettingStartedSheet)
         }
       }
     }
-    // This automatically updates when devices are discovered, connected, or disconnected
+
+    // Updates automatically when devices are discovered, connected, or disconnected
     viewModelScope.launch {
       Wearables.devices.collect { value ->
-        val hasMockDevices = MockDeviceKit.getInstance(getApplication()).pairedDevices.isNotEmpty()
-        _uiState.update {
-          it.copy(devices = value.toList().toImmutableList(), hasMockDevices = hasMockDevices)
-        }
+        _uiState.update { it.copy(devices = value.toList().toImmutableList()) }
         // Monitor device metadata for compatibility issues
         monitorDeviceCompatibility(value)
       }
@@ -103,12 +107,11 @@ class WearablesViewModel(application: Application) : AndroidViewModel(applicatio
       val job =
           viewModelScope.launch {
             Wearables.devicesMetadata[deviceId]?.collect { metadata ->
-              if (
-                  metadata.compatibility ==
-                      com.meta.wearable.dat.core.types.DeviceCompatibility.DEVICE_UPDATE_REQUIRED
-              ) {
+              if (metadata.compatibility == DeviceCompatibility.DEVICE_UPDATE_REQUIRED) {
                 val deviceName = metadata.name.ifEmpty { deviceId }
-                setRecentError("Device '$deviceName' requires an update to work with this app")
+                setRecentError(
+                    "Glasses '$deviceName' need a software update (Meta AI app) to work with this app"
+                )
               }
             }
           }
@@ -127,29 +130,29 @@ class WearablesViewModel(application: Application) : AndroidViewModel(applicatio
   fun navigateToStreaming(onRequestWearablesPermission: suspend (Permission) -> PermissionStatus) {
     viewModelScope.launch {
       val permission = Permission.CAMERA // Camera permission is required for streaming
-      val result = Wearables.checkPermissionStatus(permission)
 
-      // Handle the result
-      result.onFailure { error, _ ->
-        setRecentError("Permission check error: ${error.description}")
-        return@launch
-      }
+      // checkPermissionStatus is a suspend call that returns a DatResult
+      var currentStatus: PermissionStatus? = null
+      var checkFailed = false
+      Wearables.checkPermissionStatus(permission)
+          .onSuccess { status -> currentStatus = status }
+          .onFailure { error, _ ->
+            checkFailed = true
+            setRecentError("Permission check error: ${error.description}")
+          }
+      if (checkFailed) return@launch
 
-      val permissionStatus = result.getOrNull()
-      if (permissionStatus == PermissionStatus.Granted) {
+      if (currentStatus == PermissionStatus.Granted) {
         _uiState.update { it.copy(isStreaming = true) }
         return@launch
       }
 
-      // Request permission
-      val requestedPermissionStatus = onRequestWearablesPermission(permission)
-      when (requestedPermissionStatus) {
-        PermissionStatus.Denied -> {
-          setRecentError("Permission denied")
-        }
-        PermissionStatus.Granted -> {
-          _uiState.update { it.copy(isStreaming = true) }
-        }
+      // Not granted yet: ask through the Meta AI app
+      val requestedStatus = onRequestWearablesPermission(permission)
+      if (requestedStatus == PermissionStatus.Granted) {
+        _uiState.update { it.copy(isStreaming = true) }
+      } else {
+        setRecentError("Camera permission for the glasses was not granted")
       }
     }
   }
@@ -168,14 +171,6 @@ class WearablesViewModel(application: Application) : AndroidViewModel(applicatio
 
   fun hideSettings() {
     _uiState.update { it.copy(isSettingsVisible = false) }
-  }
-
-  fun showDebugMenu() {
-    _uiState.update { it.copy(isDebugMenuVisible = true) }
-  }
-
-  fun hideDebugMenu() {
-    _uiState.update { it.copy(isDebugMenuVisible = false) }
   }
 
   fun clearCameraPermissionError() {

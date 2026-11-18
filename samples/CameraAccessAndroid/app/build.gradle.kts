@@ -6,27 +6,62 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import java.util.Properties
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
   alias(libs.plugins.android.application)
   alias(libs.plugins.jetbrains.kotlin.android)
   alias(libs.plugins.compose.compiler)
 }
 
+val localProperties =
+    Properties().apply {
+      val file = rootDir.resolve("local.properties")
+      if (file.exists()) {
+        file.inputStream().use { load(it) }
+      }
+    }
+
 android {
   namespace = "com.meta.wearable.dat.externalsampleapps.cameraaccess"
-  compileSdk = 35
+  // DAT SDK 1.0.1 is built against API 36 (same as Meta's own sample).
+  compileSdk = 36
 
-  buildFeatures { buildConfig = true }
+  buildFeatures {
+    buildConfig = true
+    compose = true
+  }
 
   defaultConfig {
     applicationId = "com.meta.wearable.dat.externalsampleapps.cameraaccess"
     minSdk = 31
+    // Kept at 34 (as before) so Android behaviour of the app does not change in this upgrade.
     targetSdk = 34
-    versionCode = 1
-    versionName = "1.0"
+    versionCode = 2
+    versionName = "1.1-gemini-direct"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     vectorDrawables { useSupportLibrary = true }
+
+    // Meta Wearables Device Access Toolkit setup.
+    // In Developer Mode (Meta AI app) these stay empty, exactly as in Meta's sample.
+    // Without Developer Mode they must hold the app's ID and client token from the
+    // Wearables Developer Center (put them in local.properties).
+    manifestPlaceholders["mwdat_application_id"] =
+        localProperties.getProperty("mwdat_application_id", "")
+    manifestPlaceholders["mwdat_client_token"] =
+        localProperties.getProperty("mwdat_client_token", "")
+  }
+
+  signingConfigs {
+    // Fixed sample key so every new build installs over the previous one.
+    getByName("debug") {
+      storeFile = file("sample.keystore")
+      storePassword = "sample"
+      keyAlias = "sample"
+      keyPassword = "sample"
+    }
   }
 
   buildTypes {
@@ -37,22 +72,13 @@ android {
     }
   }
   compileOptions {
-    sourceCompatibility = JavaVersion.VERSION_1_8
-    targetCompatibility = JavaVersion.VERSION_1_8
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
   }
-  kotlinOptions { jvmTarget = "1.8" }
-  buildFeatures { compose = true }
-  composeOptions { kotlinCompilerExtensionVersion = "1.5.1" }
   packaging { resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" } }
-  signingConfigs {
-    getByName("debug") {
-      storeFile = file("sample.keystore")
-      storePassword = "sample"
-      keyAlias = "sample"
-      keyPassword = "sample"
-    }
-  }
 }
+
+kotlin { compilerOptions { jvmTarget = JvmTarget.JVM_17 } }
 
 dependencies {
   implementation(libs.androidx.activity.compose)
@@ -65,7 +91,6 @@ dependencies {
   implementation(libs.kotlinx.collections.immutable)
   implementation(libs.mwdat.core)
   implementation(libs.mwdat.camera)
-  implementation(libs.mwdat.mockdevice)
   // VisionClaw additions
   implementation(libs.okhttp)
   implementation(libs.webrtc)
@@ -76,7 +101,4 @@ dependencies {
   implementation(libs.datastore.preferences)
   implementation(libs.gson)
   implementation(libs.lifecycle.process)
-  androidTestImplementation(libs.androidx.ui.test.junit4)
-  androidTestImplementation(libs.androidx.test.uiautomator)
-  androidTestImplementation(libs.androidx.test.rules)
 }

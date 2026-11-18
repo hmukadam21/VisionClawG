@@ -14,6 +14,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
@@ -22,10 +24,17 @@
         android:usesCleartextTraffic="true"
         android:theme="@style/Theme.CameraAccess">
 
-        <!-- Without Developer Mode, this key will need to be set with ID from app registered in Wearables Developer Center -->
+        <!-- Meta Wearables Device Access Toolkit (SDK 1.0.1) setup.
+             In Developer Mode these stay empty (as in Meta's own sample). Without Developer
+             Mode they must hold the app's ID and client token from Wearables Developer Center;
+             the values come from app/build.gradle.kts (local.properties). -->
         <meta-data
             android:name="com.meta.wearable.mwdat.APPLICATION_ID"
-            android:value="0"
+            android:value="${mwdat_application_id}"
+            />
+        <meta-data
+            android:name="com.meta.wearable.mwdat.CLIENT_TOKEN"
+            android:value="${mwdat_client_token}"
             />
 
         <activity
@@ -54,6 +63,7 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
         <!-- Foreground service for background streaming -->
         <service
             android:name=".stream.StreamingService"

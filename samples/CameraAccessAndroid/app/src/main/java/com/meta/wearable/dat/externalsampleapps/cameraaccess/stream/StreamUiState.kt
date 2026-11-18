@@ -6,19 +6,20 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-// StreamUiState - DAT Camera Streaming UI State
+// StreamUiState - DAT Camera Streaming UI State (DAT SDK 1.0.1)
 //
-// This data class manages UI state for camera streaming operations using the DAT API.
+// In SDK 1.0.1 the stream state is StreamState (STOPPED, STARTING, STARTED, STREAMING, PAUSED,
+// STOPPING, CLOSED); SDK 0.4.0's StreamSessionState no longer exists.
 
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.stream
 
 import android.graphics.Bitmap
-import com.meta.wearable.dat.camera.types.StreamSessionState
+import com.meta.wearable.dat.camera.types.StreamState
 
 enum class StreamingMode { GLASSES, PHONE }
 
 data class StreamUiState(
-    val streamSessionState: StreamSessionState = StreamSessionState.STOPPED,
+    val streamSessionState: StreamState = StreamState.STOPPED,
     val videoFrame: Bitmap? = null,
     val capturedPhoto: Bitmap? = null,
     val isShareDialogVisible: Boolean = false,

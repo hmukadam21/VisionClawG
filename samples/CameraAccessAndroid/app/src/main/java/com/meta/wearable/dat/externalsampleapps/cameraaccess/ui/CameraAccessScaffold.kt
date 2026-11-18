@@ -8,19 +8,15 @@
 
 // CameraAccessScaffold - DAT Application Navigation Orchestrator
 //
-// This scaffold demonstrates a typical DAT application navigation pattern based on device
-// registration and streaming states from the DAT API.
+// Navigation based on device registration and streaming state from the DAT API:
+// - HomeScreen: when NOT registered (uiState.isRegistered = false); shows the registration
+//   button that calls Wearables.startRegistration()
+// - NonStreamScreen: when registered but not streaming; device selection, permission checks
+// - StreamScreen: when streaming (uiState.isStreaming = true); live video, Gemini, photo capture
+// - SettingsScreen: Gemini API key, system prompt and other settings
 //
-// DAT State-Based Navigation:
-// - HomeScreen: When NOT registered (uiState.isRegistered = false) Shows initial registration UI
-//   calling Wearables.startRegistration()
-// - NonStreamScreen: When registered (uiState.isRegistered = true) but not streaming Shows device
-//   selection, permission checking, and pre-streaming setup
-// - StreamScreen: When actively streaming (uiState.isStreaming = true) Shows live video from
-//   StreamSession.videoStream and photo capture UI
-//
-// The scaffold also provides a debug menu (in DEBUG builds) that gives access to
-// MockDeviceKitScreen for testing DAT functionality without physical devices.
+// The debug menu with MockDeviceKitScreen (pretend glasses) was removed in the DAT SDK 1.0.1
+// upgrade; this build is for real glasses (or the phone camera).
 
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.ui
 
@@ -33,19 +29,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Error
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -56,10 +47,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.meta.wearable.dat.core.types.Permission
 import com.meta.wearable.dat.core.types.PermissionStatus
-import com.meta.wearable.dat.externalsampleapps.cameraaccess.BuildConfig
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.wearables.WearablesViewModel
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CameraAccessScaffold(
     viewModel: WearablesViewModel,
@@ -68,9 +57,8 @@ fun CameraAccessScaffold(
 ) {
   val uiState by viewModel.uiState.collectAsStateWithLifecycle()
   val snackbarHostState = remember { SnackbarHostState() }
-  val bottomSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
-  // Observe camera permission errors and show snackbar
+  // Show errors (permissions, glasses connection, stream) in a snackbar
   LaunchedEffect(uiState.recentError) {
     uiState.recentError?.let { errorMessage ->
       snackbarHostState.showSnackbar(errorMessage)
@@ -125,25 +113,6 @@ fun CameraAccessScaffold(
             }
           },
       )
-
-      if (BuildConfig.DEBUG) {
-        FloatingActionButton(
-            onClick = { viewModel.showDebugMenu() },
-            modifier = Modifier.align(Alignment.CenterEnd),
-        ) {
-          Icon(Icons.Default.BugReport, contentDescription = "Debug Menu")
-        }
-
-        if (uiState.isDebugMenuVisible) {
-          ModalBottomSheet(
-              onDismissRequest = { viewModel.hideDebugMenu() },
-              sheetState = bottomSheetState,
-              modifier = Modifier.fillMaxSize(),
-          ) {
-            MockDeviceKitScreen(modifier = Modifier.fillMaxSize())
-          }
-        }
-      }
     }
   }
 }
