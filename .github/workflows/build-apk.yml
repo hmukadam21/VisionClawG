@@ -24,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
+        shell: bash   # explicit bash = -eo pipefail, so a failure before "| tee" fails the step
         working-directory: samples/CameraAccessAndroid
     steps:
       - name: Check out the code
@@ -37,26 +38,27 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Check the Meta packages token
+      - name: Check where Meta's SDK can be downloaded (information only)
         id: token
         env:
           META_PACKAGES_TOKEN: ${{ secrets.META_PACKAGES_TOKEN }}
         run: |
           {
-            echo "== token check"
-            if [ -z "$META_PACKAGES_TOKEN" ]; then
-              echo "MISSING: the secret META_PACKAGES_TOKEN is empty or not visible to this run"
-              exit 1
+            echo "== SDK availability check (never fails the build)"
+            V=$(grep -E '^mwdat *=' gradle/libs.versions.toml | sed -E 's/.*"(.*)".*/\1/')
+            echo "app asks for mwdat version: $V"
+            echo "-- Maven Central: versions of com.meta.wearable:mwdat-core"
+            curl -s https://repo1.maven.org/maven2/com/meta/wearable/mwdat-core/maven-metadata.xml \
+              | grep -o '<version>[^<]*</version>' | sed -E 's/<\/?version>//g' | tr '\n' ' '; echo
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://repo1.maven.org/maven2/com/meta/wearable/mwdat-core/$V/mwdat-core-$V.pom")
+            echo "Maven Central has mwdat-core $V: HTTP $CODE"
+            if [ -n "$META_PACKAGES_TOKEN" ]; then
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" -u "token:$META_PACKAGES_TOKEN" "https://maven.pkg.github.com/facebook/meta-wearables-dat-android/com/meta/wearable/mwdat-core/$V/mwdat-core-$V.pom")
+              echo "GitHub Packages has mwdat-core $V: HTTP $CODE"
+            else
+              echo "GitHub Packages: not checked (no META_PACKAGES_TOKEN)"
             fi
-            echo "token present, ${#META_PACKAGES_TOKEN} characters, starts with ${META_PACKAGES_TOKEN:0:4}"
-            URL="https://maven.pkg.github.com/facebook/meta-wearables-dat-android/com/meta/wearable/mwdat-core/0.4.0/mwdat-core-0.4.0.pom"
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" -u "token:$META_PACKAGES_TOKEN" "$URL")
-            echo "Meta SDK (mwdat-core 0.4.0) download test: HTTP $CODE"
-            if [ "$CODE" != "200" ]; then
-              echo "FAILED: the token cannot download Meta's SDK (401 = bad token or missing read:packages, 404 = version not found)"
-              exit 1
-            fi
-          } 2>&1 | tee -a /tmp/build-log.txt
+          } 2>&1 | tee -a /tmp/build-log.txt || true
 
       - name: Create Secrets.kt from the template (placeholders only)
         id: secrets
