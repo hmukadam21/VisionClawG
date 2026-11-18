@@ -5,7 +5,9 @@ import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.SettingsMa
 object GeminiConfig {
     const val WEBSOCKET_BASE_URL =
         "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-    const val MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+    // gemini-2.5-flash-native-audio-preview-12-2025 was shut down on 17 Nov 2026;
+    // gemini-3.8-live is Google's named replacement.
+    const val MODEL = "models/gemini-3.8-live"
 
     const val INPUT_AUDIO_SAMPLE_RATE = 16000
     const val OUTPUT_AUDIO_SAMPLE_RATE = 24000

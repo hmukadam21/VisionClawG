@@ -1,0 +1,77 @@
+name: Build Android APK
+
+# Builds the Gemini-direct VisionClaw Android app in the cloud (no computer needed)
+# and publishes the APK as a GitHub Release so it can be downloaded straight to the phone.
+#
+# Needs one repository secret:
+#   META_PACKAGES_TOKEN  - a GitHub classic token with the read:packages scope,
+#                          used only to download Meta's glasses SDK from GitHub Packages.
+# The Gemini API key is NOT baked in: it is typed into the app's Settings screen.
+
+on:
+  push:
+    branches: [gemini-direct]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: samples/CameraAccessAndroid
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Check the Meta packages token is set
+        env:
+          META_PACKAGES_TOKEN: ${{ secrets.META_PACKAGES_TOKEN }}
+        run: |
+          if [ -z "$META_PACKAGES_TOKEN" ]; then
+            echo "::error::The repository secret META_PACKAGES_TOKEN is missing."
+            exit 1
+          fi
+
+      - name: Create Secrets.kt from the template (placeholders only)
+        run: |
+          D=app/src/main/java/com/meta/wearable/dat/externalsampleapps/cameraaccess
+          cp "$D/Secrets.kt.example" "$D/Secrets.kt"
+
+      - name: Build the APK
+        env:
+          GITHUB_TOKEN: ${{ secrets.META_PACKAGES_TOKEN }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Rename the APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk VisionClaw.apk
+
+      - name: Keep the APK as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VisionClaw-apk
+          path: samples/CameraAccessAndroid/VisionClaw.apk
+
+      - name: Publish the APK as the "latest-apk" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest-apk --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          gh release create latest-apk VisionClaw.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "VisionClaw APK (latest build)" \
+            --notes "Built from ${GITHUB_SHA::7} on the gemini-direct branch."

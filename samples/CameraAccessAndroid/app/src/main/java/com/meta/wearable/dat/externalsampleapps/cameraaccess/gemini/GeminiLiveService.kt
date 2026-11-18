@@ -216,9 +216,7 @@ class GeminiLiveService {
                 put("model", GeminiConfig.MODEL)
                 put("generationConfig", JSONObject().apply {
                     put("responseModalities", JSONArray().put("AUDIO"))
-                    put("thinkingConfig", JSONObject().apply {
-                        put("thinkingBudget", 0)
-                    })
+                    // gemini-3.8-live does not accept thinkingConfig; it must be omitted.
                 })
                 put("systemInstruction", JSONObject().apply {
                     put("parts", JSONArray().put(JSONObject().apply {
@@ -237,7 +235,7 @@ class GeminiLiveService {
                         put("prefixPaddingMs", 40)
                     })
                     put("activityHandling", "START_OF_ACTIVITY_INTERRUPTS")
-                    put("turnCoverage", "TURN_INCLUDES_ALL_INPUT")
+                    // turnCoverage left to the model default (audio activity + all video).
                 })
                 put("contextWindowCompression", JSONObject().apply {
                     put("slidingWindow", JSONObject().apply {
