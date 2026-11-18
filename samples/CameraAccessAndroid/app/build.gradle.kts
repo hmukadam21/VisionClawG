@@ -34,12 +34,14 @@ android {
   }
 
   defaultConfig {
-    applicationId = "com.meta.wearable.dat.externalsampleapps.cameraaccess"
+    // Own app ID (was Meta's sample ID). Needed to register the app in Meta's Wearables Developer
+    // Center (e.g. for "Hey Meta, start VisionClaw"). The code package (namespace) is unchanged.
+    applicationId = "com.hmukadam21.visionclaw"
     minSdk = 31
-    // Kept at 34 (as before) so Android behaviour of the app does not change in this upgrade.
+    // Kept at 34 so Android behaviour of the app does not change in this upgrade.
     targetSdk = 34
-    versionCode = 2
-    versionName = "1.1-gemini-direct"
+    versionCode = 3
+    versionName = "1.2-pocket"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     vectorDrawables { useSupportLibrary = true }

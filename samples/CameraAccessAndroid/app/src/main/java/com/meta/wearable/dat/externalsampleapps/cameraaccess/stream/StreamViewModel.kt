@@ -8,15 +8,17 @@
 
 // StreamViewModel - glasses camera streaming (DAT SDK 1.0.1) + VisionClaw frame forwarding
 //
-// SDK 1.0.1 lifecycle (replaces SDK 0.4.0's single Wearables.startStreamSession call):
+// SDK 1.0.1 lifecycle:
 //   1. Wearables.createSession(deviceSelector)  -> DeviceSession
 //   2. session.start()                          -> wait for DeviceSessionState.STARTED
 //   3. session.addCamera(StreamConfiguration)   -> Camera, whose .stream is the video Stream
 //   4. stream.start()                           -> frames arrive on stream.videoStream
 //   5. stop: camera.close(), session.stop()
 //
-// Frames are requested raw (the SDK default, I420 YUV), converted to a Bitmap and forwarded to
-// Gemini (throttled to ~1 fps inside GeminiSessionViewModel) and WebRTC, as before.
+// Pocket mode (v1.2): the stream is requested COMPRESSED (HEVC). The SDK keeps a compressed
+// stream flowing when the phone is locked or the app is in the background, while a raw stream
+// pauses. GlassesFrameDecoder turns the HEVC frames back into Bitmaps (a few per second), which
+// are shown on screen and forwarded to Gemini (~1 per second) and WebRTC.
 
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.stream
 
@@ -74,9 +76,13 @@ class StreamViewModel(
     private const val TAG = "StreamViewModel"
     private val INITIAL_STATE = StreamUiState()
 
-    // Valid SDK frame rates: 2, 7, 15, 24, 30. Gemini only needs ~1 fps; 15 keeps the on-screen
-    // preview smooth while halving the work compared with 30.
-    private const val FRAME_RATE = 15
+    // Valid SDK frame rates: 2, 7, 15, 24, 30. Gemini looks about once a second, so 7 fps from
+    // the glasses is plenty and costs the glasses battery far less than 24 or 30.
+    private const val FRAME_RATE = 7
+
+    // Decoded pictures turned into Bitmaps at most every 250 ms (~4 per second) for the on-screen
+    // preview; Gemini takes one per second of those (throttled in GeminiSessionViewModel).
+    private const val PICTURE_INTERVAL_MS = 250L
   }
 
   private val deviceSelector: DeviceSelector = wearablesViewModel.deviceSelector
@@ -88,8 +94,9 @@ class StreamViewModel(
   private var session: DeviceSession? = null
   private var camera: Camera? = null
   private var stream: Stream? = null
+  @Volatile private var frameDecoder: GlassesFrameDecoder? = null
 
-  // Frame conversion runs off the main thread, one frame at a time, in order.
+  // Frame handling runs off the main thread, one frame at a time, in order.
   private val frameDispatcher = Dispatchers.Default.limitedParallelism(1)
 
   private var sessionStateJob: Job? = null
@@ -107,13 +114,26 @@ class StreamViewModel(
   var webrtcViewModel: WebRTCSessionViewModel? = null
   private var phoneCameraManager: PhoneCameraManager? = null
 
+  init {
+    // "Stop" tapped in the notification: end Gemini, the live share and the glasses stream.
+    viewModelScope.launch {
+      StreamingService.stopRequests.collect {
+        Log.d(TAG, "Stop requested from notification")
+        geminiViewModel?.stopSession()
+        webrtcViewModel?.stopSession()
+        stopStream()
+        wearablesViewModel.navigateToDeviceSelection()
+      }
+    }
+  }
+
   // MARK: - Glasses streaming
 
   fun startStream() {
     stopStream()
     stopping = false
 
-    // Foreground service keeps streaming alive while the screen is off
+    // Foreground service keeps glasses link + microphone alive while the screen is off
     StreamingService.start(getApplication())
     _uiState.update {
       it.copy(streamingMode = StreamingMode.GLASSES, streamSessionState = StreamState.STARTING)
@@ -157,11 +177,15 @@ class StreamViewModel(
 
   private fun attachCamera(currentSession: DeviceSession) {
     if (camera != null) return
+    frameDecoder?.release()
+    frameDecoder = GlassesFrameDecoder(PICTURE_INTERVAL_MS) { bitmap -> onPicture(bitmap) }
     currentSession
         .addCamera(
             StreamConfiguration(
                 videoQuality = VideoQuality.MEDIUM,
                 frameRate = FRAME_RATE,
+                // Compressed: keeps flowing with the phone locked / app in background.
+                compressVideo = true,
             )
         )
         .onSuccess { addedCamera ->
@@ -265,6 +289,9 @@ class StreamViewModel(
     sessionErrorJob?.cancel()
     sessionErrorJob = null
 
+    frameDecoder?.release()
+    frameDecoder = null
+
     // Closing the camera stops its stream; stopping the session releases the glasses.
     runCatching { camera?.close() }.onFailure { Log.w(TAG, "camera close failed", it) }
     camera = null
@@ -354,9 +381,25 @@ class StreamViewModel(
   // MARK: - Frames
 
   private fun handleVideoFrame(videoFrame: VideoFrame) {
-    // We ask for raw frames; a compressed (HEVC) frame would need a decoder, so skip it.
-    if (videoFrame.isCompressed) return
+    if (videoFrame.isCompressed) {
+      // Normal path: HEVC -> decoder -> onPicture()
+      frameDecoder?.decode(videoFrame)
+      return
+    }
+    // Fallback: a raw I420 frame (only if the SDK ignored compressVideo)
+    handleRawFrame(videoFrame)
+  }
 
+  /** A decoded picture from the glasses (called on the decoder's thread). */
+  private fun onPicture(bitmap: Bitmap) {
+    _uiState.update { it.copy(videoFrame = bitmap) }
+    // Forward to Gemini (throttled to ~1 per second inside the VM)
+    geminiViewModel?.sendVideoFrameIfThrottled(bitmap)
+    // Forward to WebRTC
+    webrtcViewModel?.pushVideoFrame(bitmap)
+  }
+
+  private fun handleRawFrame(videoFrame: VideoFrame) {
     val width = videoFrame.width
     val height = videoFrame.height
     val buffer = videoFrame.buffer
@@ -366,13 +409,11 @@ class StreamViewModel(
       return
     }
 
-    // Copy the I420 bytes without moving the buffer position
     val byteArray = ByteArray(expectedSize)
     val originalPosition = buffer.position()
     buffer.get(byteArray, 0, expectedSize)
     buffer.position(originalPosition)
 
-    // Convert I420 to NV21, which Android's YuvImage can compress to JPEG
     val nv21 = convertI420toNV21(byteArray, width, height)
     val image = YuvImage(nv21, ImageFormat.NV21, width, height, null)
     val jpeg =
@@ -380,14 +421,8 @@ class StreamViewModel(
           image.compressToJpeg(Rect(0, 0, width, height), 50, out)
           out.toByteArray()
         }
-
     val bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return
-    _uiState.update { it.copy(videoFrame = bitmap) }
-
-    // Forward to Gemini (throttled inside the VM)
-    geminiViewModel?.sendVideoFrameIfThrottled(bitmap)
-    // Forward to WebRTC (every frame)
-    webrtcViewModel?.pushVideoFrame(bitmap)
+    onPicture(bitmap)
   }
 
   // Convert I420 (YYYYYYYY:UU:VV) to NV21 (YYYYYYYY:VUVU)

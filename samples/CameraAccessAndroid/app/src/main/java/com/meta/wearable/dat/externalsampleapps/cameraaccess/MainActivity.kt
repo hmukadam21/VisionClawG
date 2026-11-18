@@ -12,7 +12,9 @@ import android.Manifest.permission.BLUETOOTH
 import android.Manifest.permission.BLUETOOTH_CONNECT
 import android.Manifest.permission.CAMERA
 import android.Manifest.permission.INTERNET
+import android.Manifest.permission.POST_NOTIFICATIONS
 import android.Manifest.permission.RECORD_AUDIO
+import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -34,9 +36,21 @@ import kotlinx.coroutines.sync.withLock
 
 class MainActivity : ComponentActivity() {
   companion object {
-    val PERMISSIONS: Array<String> = arrayOf(
-        BLUETOOTH, BLUETOOTH_CONNECT, INTERNET, RECORD_AUDIO, CAMERA,
-    )
+    // Needed for the app to work at all
+    val PERMISSIONS: Array<String> =
+        arrayOf(
+            BLUETOOTH,
+            BLUETOOTH_CONNECT,
+            INTERNET,
+            RECORD_AUDIO,
+            CAMERA,
+        )
+
+    // Nice to have: shows the "VisionClaw is running" notification with its Stop button
+    // (Android 13+). Refusing it does not block the app.
+    val OPTIONAL_PERMISSIONS: Array<String> =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) arrayOf(POST_NOTIFICATIONS)
+        else emptyArray()
   }
 
   val viewModel: WearablesViewModel by viewModels()
@@ -67,10 +81,10 @@ class MainActivity : ComponentActivity() {
     // Initialize settings with app context
     SettingsManager.init(this)
 
-    // Keep screen on while streaming
+    // Keep screen on while the app is open (lock the phone with the power button for pocket use)
     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-    // First, ensure the app has necessary Android permissions
+    // First, ensure the app has the necessary Android permissions
     checkPermissions {
       // Initialize the DAT SDK once the permissions are granted
       Wearables.initialize(this)
@@ -89,7 +103,8 @@ class MainActivity : ComponentActivity() {
 
   fun checkPermissions(onPermissionsGranted: () -> Unit) {
     registerForActivityResult(RequestMultiplePermissions()) { permissionsResult ->
-          val granted = permissionsResult.entries.all { it.value }
+          // Only the required permissions decide; the notification permission is optional.
+          val granted = PERMISSIONS.all { permissionsResult[it] != false }
           if (granted) {
             onPermissionsGranted()
           } else {
@@ -98,6 +113,6 @@ class MainActivity : ComponentActivity() {
             )
           }
         }
-        .launch(PERMISSIONS)
+        .launch(PERMISSIONS + OPTIONAL_PERMISSIONS)
   }
 }

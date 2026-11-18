@@ -1,5 +1,15 @@
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 
+// GeminiLiveService - WebSocket client for the Gemini Live API (gemini-3.8-live)
+//
+// v1.2 additions for long, pocket-style sessions:
+// - Session resumption: the server sends sessionResumptionUpdate messages with a handle; a new
+//   connection opened with that handle continues the SAME conversation. Google ends every Live
+//   connection after roughly 10 minutes (it sends goAway first), so the app reconnects with the
+//   handle and the user does not notice.
+// - Stale-socket guard: events from an old WebSocket (closing after a reconnect) are ignored, so
+//   they cannot tear down the new connection.
+
 import android.graphics.Bitmap
 import android.util.Base64
 import android.util.Log
@@ -34,6 +44,7 @@ sealed class GeminiConnectionState {
 class GeminiLiveService {
     companion object {
         private const val TAG = "GeminiLiveService"
+        private const val CONNECT_TIMEOUT_MS = 15000L
     }
 
     private val _connectionState = MutableStateFlow<GeminiConnectionState>(GeminiConnectionState.Disconnected)
@@ -55,15 +66,26 @@ class GeminiLiveService {
     private var lastUserSpeechEnd: Long = 0
     private var responseLatencyLogged = false
 
-    private var webSocket: WebSocket? = null
+    @Volatile private var webSocket: WebSocket? = null
     private val sendExecutor = Executors.newSingleThreadExecutor()
-    private var connectCallback: ((Boolean) -> Unit)? = null
+    @Volatile private var connectCallback: ((Boolean) -> Unit)? = null
     private var timeoutTimer: Timer? = null
+
+    // Latest resumable session handle from the server (null = start a new conversation)
+    @Volatile private var resumptionHandle: String? = null
+
+    val hasResumptionHandle: Boolean
+        get() = resumptionHandle != null
 
     private val client = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .pingInterval(10, TimeUnit.SECONDS)
         .build()
+
+    /** Forget the previous conversation; the next connect() starts a fresh one. */
+    fun clearResumption() {
+        resumptionHandle = null
+    }
 
     fun connect(callback: (Boolean) -> Unit) {
         val url = GeminiConfig.websocketURL()
@@ -77,49 +99,67 @@ class GeminiLiveService {
         connectCallback = callback
 
         val request = Request.Builder().url(url).build()
-        webSocket = client.newWebSocket(request, object : WebSocketListener() {
+        val socket = client.newWebSocket(request, object : WebSocketListener() {
+            // Only the current socket may change state; an old one closing late is ignored.
+            private fun isCurrent(ws: WebSocket) = ws === this@GeminiLiveService.webSocket
+
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                Log.d(TAG, "WebSocket opened")
+                if (!isCurrent(webSocket)) return
+                Log.d(TAG, "WebSocket opened (resuming: ${resumptionHandle != null})")
                 _connectionState.value = GeminiConnectionState.SettingUp
-                sendSetupMessage()
+                sendSetupMessage(webSocket)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (!isCurrent(webSocket)) return
                 handleMessage(text)
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                if (!isCurrent(webSocket)) return
                 handleMessage(bytes.utf8())
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if (!isCurrent(webSocket)) return
                 val msg = t.message ?: "Unknown error"
                 Log.e(TAG, "WebSocket failure: $msg")
                 _connectionState.value = GeminiConnectionState.Error(msg)
                 _isModelSpeaking.value = false
+                val wasConnecting = connectCallback != null
                 resolveConnect(false)
-                onDisconnected?.invoke(msg)
+                // A failure while connecting is reported through the connect callback only.
+                if (!wasConnecting) onDisconnected?.invoke(msg)
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                if (!isCurrent(webSocket)) return
                 Log.d(TAG, "WebSocket closing: $code $reason")
-                _connectionState.value = GeminiConnectionState.Disconnected
+                val wasConnecting = connectCallback != null
+                // While connecting, keep Gemini's reason visible (e.g. a rejected setup field)
+                _connectionState.value =
+                    if (wasConnecting) GeminiConnectionState.Error("Gemini closed the connection ($code): $reason")
+                    else GeminiConnectionState.Disconnected
                 _isModelSpeaking.value = false
                 resolveConnect(false)
-                onDisconnected?.invoke("Connection closed (code $code: $reason)")
+                if (!wasConnecting) onDisconnected?.invoke("Connection closed (code $code: $reason)")
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (!isCurrent(webSocket)) return
                 Log.d(TAG, "WebSocket closed: $code $reason")
                 _connectionState.value = GeminiConnectionState.Disconnected
                 _isModelSpeaking.value = false
             }
         })
+        webSocket = socket
 
-        // Timeout after 15 seconds (use Timer so we don't block sendExecutor)
+        // Timeout (Timer so we don't block sendExecutor)
+        timeoutTimer?.cancel()
         timeoutTimer = Timer().apply {
             schedule(object : TimerTask() {
                 override fun run() {
+                    if (webSocket !== socket) return
                     if (_connectionState.value == GeminiConnectionState.Connecting
                         || _connectionState.value == GeminiConnectionState.SettingUp) {
                         Log.e(TAG, "Connection timed out")
@@ -127,17 +167,24 @@ class GeminiLiveService {
                         resolveConnect(false)
                     }
                 }
-            }, 15000)
+            }, CONNECT_TIMEOUT_MS)
         }
     }
 
-    fun disconnect() {
+    /**
+     * Closes the connection.
+     * @param clearToolCallbacks false when reconnecting, so tool-call handling stays wired up.
+     */
+    fun disconnect(clearToolCallbacks: Boolean = true) {
         timeoutTimer?.cancel()
         timeoutTimer = null
-        webSocket?.close(1000, null)
-        webSocket = null
-        onToolCall = null
-        onToolCallCancellation = null
+        val old = webSocket
+        webSocket = null // events from `old` are now ignored
+        old?.close(1000, null)
+        if (clearToolCallbacks) {
+            onToolCall = null
+            onToolCallCancellation = null
+        }
         _connectionState.value = GeminiConnectionState.Disconnected
         _isModelSpeaking.value = false
         resolveConnect(false)
@@ -210,7 +257,7 @@ class GeminiLiveService {
         cb?.invoke(success)
     }
 
-    private fun sendSetupMessage() {
+    private fun sendSetupMessage(socket: WebSocket) {
         val setup = JSONObject().apply {
             put("setup", JSONObject().apply {
                 put("model", GeminiConfig.MODEL)
@@ -242,12 +289,16 @@ class GeminiLiveService {
                         put("targetTokens", 80000)
                     })
                 })
+                // Ask for resumption handles; pass the last one to continue that conversation.
+                put("sessionResumption", JSONObject().apply {
+                    resumptionHandle?.let { put("handle", it) }
+                })
                 put("inputAudioTranscription", JSONObject())
                 put("outputAudioTranscription", JSONObject())
             })
         }
         // Send directly (not via sendExecutor) to ensure it's the first message
-        webSocket?.send(setup.toString())
+        socket.send(setup.toString())
     }
 
     private fun handleMessage(text: String) {
@@ -261,13 +312,24 @@ class GeminiLiveService {
                 return
             }
 
-            // GoAway
+            // New resumption handle (may arrive on its own or alongside other content)
+            if (json.has("sessionResumptionUpdate")) {
+                val update = json.getJSONObject("sessionResumptionUpdate")
+                val handle = update.optString("newHandle", "")
+                if (update.optBoolean("resumable", false) && handle.isNotEmpty()) {
+                    resumptionHandle = handle
+                }
+                if (json.length() == 1) return
+            }
+
+            // GoAway: the server will close this connection soon; the view model reconnects
             if (json.has("goAway")) {
                 val goAway = json.getJSONObject("goAway")
-                val seconds = goAway.optJSONObject("timeLeft")?.optInt("seconds", 0) ?: 0
+                val timeLeft = goAway.opt("timeLeft")?.toString() ?: "?"
+                Log.d(TAG, "goAway received (time left: $timeLeft)")
                 _connectionState.value = GeminiConnectionState.Disconnected
                 _isModelSpeaking.value = false
-                onDisconnected?.invoke("Server closing (time left: ${seconds}s)")
+                onDisconnected?.invoke("goAway")
                 return
             }
 

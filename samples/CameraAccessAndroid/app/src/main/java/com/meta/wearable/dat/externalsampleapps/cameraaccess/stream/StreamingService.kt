@@ -15,32 +15,42 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.MainActivity
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.R
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 
 /**
- * Foreground service that keeps the camera streaming alive when the screen is locked
- * or the app is in the background.
+ * Foreground service that keeps VisionClaw working while the phone is locked or in a pocket.
  *
- * - Displays a persistent notification while streaming
- * - Acquires a partial wake lock to prevent CPU sleep
- * - Allows the streaming to continue when the app is backgrounded
+ * - Type "connectedDevice": keeps the link to the glasses alive.
+ * - Type "microphone": Android only lets a background app hear the mic through a foreground
+ *   service of this type; without it your voice is silenced as soon as the screen goes off.
+ * - Partial wake lock: keeps the processor running while the screen is off (released on stop).
+ * - Notification with a "Stop" button that ends the glasses stream and the Gemini session
+ *   without opening the app.
  */
 class StreamingService : Service() {
 
   companion object {
     private const val TAG = "StreamingService"
     private const val CHANNEL_ID = "streaming_channel"
-    private const val CHANNEL_NAME = "Camera Streaming"
+    private const val CHANNEL_NAME = "VisionClaw running"
     private const val NOTIFICATION_ID = 1001
     private const val WAKELOCK_TAG = "VisionClaw::StreamingWakeLock"
+    private const val ACTION_STOP = "com.visionclaw.action.STOP"
+
+    // Safety cap so a forgotten session cannot keep the phone awake forever.
+    private const val WAKELOCK_MAX_MS = 4 * 60 * 60 * 1000L // 4 hours
+
+    private val _stopRequests = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+
+    /** Emits when the user taps "Stop" in the notification. */
+    val stopRequests: SharedFlow<Unit> = _stopRequests.asSharedFlow()
 
     fun start(context: Context) {
       val intent =
           Intent(context, StreamingService::class.java).apply { `package` = context.packageName }
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        context.startForegroundService(intent)
-      } else {
-        context.startService(intent)
-      }
+      context.startForegroundService(intent)
     }
 
     fun stop(context: Context) {
@@ -61,23 +71,36 @@ class StreamingService : Service() {
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    if (intent?.action == ACTION_STOP) {
+      Log.d(TAG, "Stop tapped in notification")
+      _stopRequests.tryEmit(Unit)
+      stopSelf()
+      return START_NOT_STICKY
+    }
+
     Log.d(TAG, "Service started")
-
     val notification = createNotification()
-
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+    try {
+      startForeground(
+          NOTIFICATION_ID,
+          notification,
+          ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+              ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+      )
+    } catch (e: Exception) {
+      // E.g. microphone permission missing: keep at least the glasses connection alive.
+      Log.w(TAG, "Foreground with microphone type refused, retrying without it", e)
       startForeground(
           NOTIFICATION_ID,
           notification,
           ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
       )
-    } else {
-      startForeground(NOTIFICATION_ID, notification)
     }
 
     acquireWakeLock()
 
-    return START_STICKY
+    // Not sticky: if Android ever kills the app, do not bring back an empty notification.
+    return START_NOT_STICKY
   }
 
   override fun onDestroy() {
@@ -87,25 +110,22 @@ class StreamingService : Service() {
   }
 
   private fun createNotificationChannel() {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      val channel =
-          NotificationChannel(
-                  CHANNEL_ID,
-                  CHANNEL_NAME,
-                  NotificationManager.IMPORTANCE_LOW,
-              )
-              .apply {
-                description = "Notifications for active camera streaming"
-                setShowBadge(false)
-              }
-
-      val notificationManager = getSystemService(NotificationManager::class.java)
-      notificationManager.createNotificationChannel(channel)
-    }
+    val channel =
+        NotificationChannel(
+                CHANNEL_ID,
+                CHANNEL_NAME,
+                NotificationManager.IMPORTANCE_LOW,
+            )
+            .apply {
+              description = "Shown while VisionClaw is listening and watching through your glasses"
+              setShowBadge(false)
+            }
+    val notificationManager = getSystemService(NotificationManager::class.java)
+    notificationManager.createNotificationChannel(channel)
   }
 
   private fun createNotification(): Notification {
-    val pendingIntent =
+    val openAppIntent =
         PendingIntent.getActivity(
             this,
             0,
@@ -115,14 +135,27 @@ class StreamingService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
 
+    val stopIntent =
+        PendingIntent.getService(
+            this,
+            1,
+            Intent(this, StreamingService::class.java).apply {
+              action = ACTION_STOP
+              `package` = packageName
+            },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+
     return NotificationCompat.Builder(this, CHANNEL_ID)
-        .setContentTitle("Camera Streaming")
-        .setContentText("Streaming from your glasses...")
+        .setContentTitle("VisionClaw is running")
+        .setContentText("Glasses connected. Tap to open, or Stop to end.")
         .setSmallIcon(R.drawable.ic_launcher_foreground)
         .setOngoing(true)
-        .setContentIntent(pendingIntent)
+        .setContentIntent(openAppIntent)
+        .addAction(0, "Stop", stopIntent)
         .setPriority(NotificationCompat.PRIORITY_LOW)
         .setCategory(NotificationCompat.CATEGORY_SERVICE)
+        .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
         .build()
   }
 
@@ -131,7 +164,7 @@ class StreamingService : Service() {
       val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
       wakeLock =
           powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG).apply {
-            acquire(10 * 60 * 1000L) // 10 minutes max
+            acquire(WAKELOCK_MAX_MS)
           }
       Log.d(TAG, "WakeLock acquired")
     }

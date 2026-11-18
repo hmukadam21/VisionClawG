@@ -1,15 +1,24 @@
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 
+// GeminiSessionViewModel - runs one Gemini Live conversation (mic + glasses frames + replies)
+//
+// v1.2: automatic reconnect for long, pocket-style sessions.
+// Google closes every Live connection after roughly 10 minutes (goAway), and mobile networks
+// drop connections now and then. Instead of ending the session, the app now reconnects by itself
+// using the session-resumption handle, so the same conversation carries on. The microphone keeps
+// running during the short gap (audio is simply not sent until the link is back).
+// After 6 failed attempts in a row (about 30 seconds), it gives up and shows the error.
+
 import android.graphics.Bitmap
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawBridge
-import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawEventClient
-import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.SettingsManager
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawConnectionState
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawEventClient
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.ToolCallRouter
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.ToolCallStatus
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.SettingsManager
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.stream.StreamingMode
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -33,6 +42,9 @@ data class GeminiUiState(
 class GeminiSessionViewModel : ViewModel() {
     companion object {
         private const val TAG = "GeminiSessionVM"
+
+        // Wait before each reconnect attempt; the list length is the number of attempts.
+        private val RECONNECT_DELAYS_MS = longArrayOf(500, 1000, 2000, 4000, 8000, 15000)
     }
 
     private val _uiState = MutableStateFlow(GeminiUiState())
@@ -46,6 +58,13 @@ class GeminiSessionViewModel : ViewModel() {
     private var lastVideoFrameTime: Long = 0
     private var stateObservationJob: Job? = null
 
+    // Session bookkeeping (touched from the main thread only)
+    @Volatile private var sessionWanted = false
+    private var micStarted = false
+    private var reconnecting = false
+    private var reconnectAttempts = 0
+    private var reconnectJob: Job? = null
+
     var streamingMode: StreamingMode = StreamingMode.GLASSES
 
     fun startSession() {
@@ -58,6 +77,11 @@ class GeminiSessionViewModel : ViewModel() {
             return
         }
 
+        sessionWanted = true
+        micStarted = false
+        reconnecting = false
+        reconnectAttempts = 0
+        geminiService.clearResumption() // a new tap on the AI button = a new conversation
         _uiState.value = _uiState.value.copy(isGeminiActive = true)
 
         // Wire audio callbacks
@@ -92,13 +116,9 @@ class GeminiSessionViewModel : ViewModel() {
             )
         }
 
+        // Dropped connection (or goAway): reconnect instead of ending the session
         geminiService.onDisconnected = { reason ->
-            if (_uiState.value.isGeminiActive) {
-                stopSession()
-                _uiState.value = _uiState.value.copy(
-                    errorMessage = "Connection lost: ${reason ?: "Unknown error"}"
-                )
-            }
+            viewModelScope.launch { onConnectionLost(reason ?: "unknown") }
         }
 
         // Check OpenClaw and start session
@@ -108,18 +128,7 @@ class GeminiSessionViewModel : ViewModel() {
 
             // Wire tool call handling
             toolCallRouter = ToolCallRouter(openClawBridge, viewModelScope)
-
-            geminiService.onToolCall = { toolCall ->
-                for (call in toolCall.functionCalls) {
-                    toolCallRouter?.handleToolCall(call) { response ->
-                        geminiService.sendToolResponse(response)
-                    }
-                }
-            }
-
-            geminiService.onToolCallCancellation = { cancellation ->
-                toolCallRouter?.cancelToolCalls(cancellation.ids)
-            }
+            wireToolCallbacks()
 
             // Observe service state
             stateObservationJob = viewModelScope.launch {
@@ -134,58 +143,119 @@ class GeminiSessionViewModel : ViewModel() {
                 }
             }
 
-            // Connect to Gemini
+            // Connect to Gemini (first connection of this conversation)
             geminiService.connect { setupOk ->
-                if (!setupOk) {
-                    val msg = when (val state = geminiService.connectionState.value) {
-                        is GeminiConnectionState.Error -> state.message
-                        else -> "Failed to connect to Gemini"
-                    }
-                    _uiState.value = _uiState.value.copy(errorMessage = msg)
-                    geminiService.disconnect()
-                    stateObservationJob?.cancel()
-                    _uiState.value = _uiState.value.copy(
-                        isGeminiActive = false,
-                        connectionState = GeminiConnectionState.Disconnected
-                    )
-                    return@connect
-                }
-
-                // Start mic capture
-                try {
-                    audioManager.startCapture()
-                } catch (e: Exception) {
-                    _uiState.value = _uiState.value.copy(
-                        errorMessage = "Mic capture failed: ${e.message}"
-                    )
-                    geminiService.disconnect()
-                    stateObservationJob?.cancel()
-                    _uiState.value = _uiState.value.copy(
-                        isGeminiActive = false,
-                        connectionState = GeminiConnectionState.Disconnected
-                    )
-                }
-
-                // Connect to OpenClaw event stream for proactive notifications
-                if (SettingsManager.proactiveNotificationsEnabled) {
-                    eventClient.onNotification = { text ->
-                        val state = _uiState.value
-                        if (state.isGeminiActive && state.connectionState == GeminiConnectionState.Ready) {
-                            geminiService.sendTextMessage(text)
+                viewModelScope.launch {
+                    if (!sessionWanted) return@launch
+                    if (!setupOk) {
+                        val msg = when (val state = geminiService.connectionState.value) {
+                            is GeminiConnectionState.Error -> state.message
+                            else -> "Failed to connect to Gemini"
                         }
+                        stopSession()
+                        _uiState.value = _uiState.value.copy(errorMessage = msg)
+                        return@launch
                     }
-                    eventClient.connect()
+                    startMicAndEvents()
+                }
+            }
+        }
+    }
+
+    private fun wireToolCallbacks() {
+        geminiService.onToolCall = { toolCall ->
+            for (call in toolCall.functionCalls) {
+                toolCallRouter?.handleToolCall(call) { response ->
+                    geminiService.sendToolResponse(response)
+                }
+            }
+        }
+        geminiService.onToolCallCancellation = { cancellation ->
+            toolCallRouter?.cancelToolCalls(cancellation.ids)
+        }
+    }
+
+    /** Starts the microphone (once per conversation) and the optional OpenClaw event stream. */
+    private fun startMicAndEvents() {
+        if (micStarted) return
+        try {
+            audioManager.startCapture()
+            micStarted = true
+        } catch (e: Exception) {
+            stopSession()
+            _uiState.value = _uiState.value.copy(errorMessage = "Mic capture failed: ${e.message}")
+            return
+        }
+
+        // Connect to OpenClaw event stream for proactive notifications
+        if (SettingsManager.proactiveNotificationsEnabled) {
+            eventClient.onNotification = { text ->
+                val state = _uiState.value
+                if (state.isGeminiActive && state.connectionState == GeminiConnectionState.Ready) {
+                    geminiService.sendTextMessage(text)
+                }
+            }
+            eventClient.connect()
+        }
+    }
+
+    private fun onConnectionLost(reason: String) {
+        if (!sessionWanted || reconnecting) return
+        scheduleReconnect(reason)
+    }
+
+    private fun scheduleReconnect(reason: String) {
+        if (!sessionWanted) return
+        if (reconnectAttempts >= RECONNECT_DELAYS_MS.size) {
+            Log.e(TAG, "Giving up after $reconnectAttempts reconnect attempts ($reason)")
+            stopSession()
+            _uiState.value = _uiState.value.copy(errorMessage = "Connection lost: $reason")
+            return
+        }
+        reconnecting = true
+        // goAway is planned: reconnect at once. Other drops: back off a little more each time.
+        val delayMs = if (reason == "goAway") 0L else RECONNECT_DELAYS_MS[reconnectAttempts]
+        reconnectAttempts++
+        Log.d(TAG, "Reconnecting in ${delayMs}ms (attempt $reconnectAttempts, reason: $reason)")
+
+        reconnectJob?.cancel()
+        reconnectJob = viewModelScope.launch {
+            delay(delayMs)
+            if (!sessionWanted) return@launch
+            audioManager.stopPlayback()
+            geminiService.disconnect(clearToolCallbacks = false)
+            geminiService.connect { ok ->
+                viewModelScope.launch {
+                    if (!sessionWanted) return@launch
+                    if (ok) {
+                        Log.d(TAG, "Reconnected (resumed: ${geminiService.hasResumptionHandle})")
+                        reconnectAttempts = 0
+                        reconnecting = false
+                        startMicAndEvents()
+                    } else {
+                        // The stored handle may have expired: the next try starts fresh.
+                        geminiService.clearResumption()
+                        reconnecting = false
+                        scheduleReconnect("retry failed")
+                    }
                 }
             }
         }
     }
 
     fun stopSession() {
+        sessionWanted = false
+        reconnectJob?.cancel()
+        reconnectJob = null
+        reconnecting = false
+        reconnectAttempts = 0
         eventClient.disconnect()
         toolCallRouter?.cancelAll()
         toolCallRouter = null
         audioManager.stopCapture()
+        micStarted = false
         geminiService.disconnect()
+        geminiService.clearResumption()
         stateObservationJob?.cancel()
         stateObservationJob = null
         _uiState.value = GeminiUiState()
