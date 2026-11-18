@@ -41,6 +41,9 @@ import androidx.lifecycle.viewModelScope
 import com.meta.wearable.dat.camera.Camera
 import com.meta.wearable.dat.camera.Stream
 import com.meta.wearable.dat.camera.addCamera
+import com.meta.wearable.dat.camera.types.AudioCodec
+import com.meta.wearable.dat.camera.types.AudioFrame
+import com.meta.wearable.dat.camera.types.AudioSampleRate
 import com.meta.wearable.dat.camera.types.PhotoData
 import com.meta.wearable.dat.camera.types.StreamConfiguration
 import com.meta.wearable.dat.camera.types.StreamState
@@ -53,6 +56,7 @@ import com.meta.wearable.dat.core.session.DeviceSessionState
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.debug.DebugLog
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini.GeminiSessionViewModel
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.phone.PhoneCameraManager
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.SettingsManager
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.wearables.WearablesViewModel
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.webrtc.WebRTCSessionViewModel
 import java.io.ByteArrayInputStream
@@ -106,6 +110,8 @@ class StreamViewModel(
   private var videoJob: Job? = null
   private var streamStateJob: Job? = null
   private var streamErrorJob: Job? = null
+  private var audioJob: Job? = null
+  @Volatile private var audioArrivalLogged = false
 
   // True while this view model is ending the stream itself, so the STOPPED states that follow
   // are not treated as "the glasses went away".
@@ -199,12 +205,22 @@ class StreamViewModel(
 
   private fun attachCamera(currentSession: DeviceSession) {
     if (camera != null) return
-    DebugLog.log("STREAM", "adding camera (compressed HEVC, MEDIUM, $FRAME_RATE fps)")
+    // Glasses microphone audio rides along with the video (16 kHz mono PCM, Gemini's format)
+    val withAudio =
+        SettingsManager.glassesMicEnabled && wearablesViewModel.uiState.value.glassesMicGranted
+    geminiViewModel?.glassesAudioExpected = withAudio
+    DebugLog.log(
+        "STREAM",
+        "adding camera (compressed HEVC, MEDIUM, $FRAME_RATE fps, glasses mic audio=$withAudio)",
+    )
     frameDecoder?.release()
     frameDecoder = GlassesFrameDecoder(PICTURE_INTERVAL_MS) { bitmap -> onPicture(bitmap) }
+    audioArrivalLogged = false
     currentSession
         .addCamera(
             StreamConfiguration(
+                audioCodec =
+                    if (withAudio) AudioCodec.PCM(AudioSampleRate.RATE_16000, 1) else null,
                 videoQuality = VideoQuality.MEDIUM,
                 frameRate = FRAME_RATE,
                 // Compressed: keeps flowing with the phone locked / app in background.
@@ -217,6 +233,12 @@ class StreamViewModel(
           stream = addedStream
           // Subscribe before start() so no state change is missed
           observeStream(addedStream)
+          if (withAudio) {
+            audioJob =
+                viewModelScope.launch(Dispatchers.IO) {
+                  addedStream.audioStream.collect { handleAudioFrame(it) }
+                }
+          }
           addedStream.start().onFailure { error, _ ->
             DebugLog.log("STREAM", "stream start FAILED: ${error.description}")
             failAndLeave("Could not start the glasses camera: ${error.description}")
@@ -307,6 +329,9 @@ class StreamViewModel(
 
     videoJob?.cancel()
     videoJob = null
+    audioJob?.cancel()
+    audioJob = null
+    geminiViewModel?.glassesAudioExpected = false
     streamStateJob?.cancel()
     streamStateJob = null
     streamErrorJob?.cancel()
@@ -416,6 +441,31 @@ class StreamViewModel(
     }
     // Fallback: a raw I420 frame (only if the SDK ignored compressVideo)
     handleRawFrame(videoFrame)
+  }
+
+  /** Microphone audio from the glasses: 16-bit PCM, native byte order, mono, 16 kHz. */
+  private fun handleAudioFrame(frame: AudioFrame) {
+    val buffer = frame.buffer.duplicate() // leave the SDK's buffer position untouched
+    val bytes = ByteArray(buffer.remaining())
+    buffer.get(bytes)
+    if (!audioArrivalLogged) {
+      audioArrivalLogged = true
+      DebugLog.log(
+          "STREAM",
+          "glasses microphone audio arriving: ${bytes.size} bytes per frame (${frame.buffer.order()})",
+      )
+    }
+    DebugLog.glassesAudioFrames.incrementAndGet()
+    var peak = 0
+    var i = 0
+    while (i + 1 < bytes.size) {
+      val sample = ((bytes[i].toInt() and 0xFF) or (bytes[i + 1].toInt() shl 8)).toShort().toInt()
+      val a = if (sample < 0) -sample else sample
+      if (a > peak) peak = a
+      i += 2
+    }
+    DebugLog.notePeak(DebugLog.glassesMicPeak, peak)
+    geminiViewModel?.onGlassesAudio(bytes)
   }
 
   /** A decoded picture from the glasses (called on the decoder's thread). */

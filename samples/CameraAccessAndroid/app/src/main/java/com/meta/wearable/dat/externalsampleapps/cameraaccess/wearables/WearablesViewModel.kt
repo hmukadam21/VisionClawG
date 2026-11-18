@@ -33,6 +33,8 @@ import com.meta.wearable.dat.core.types.DeviceIdentifier
 import com.meta.wearable.dat.core.types.Permission
 import com.meta.wearable.dat.core.types.PermissionStatus
 import com.meta.wearable.dat.core.types.RegistrationState
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.debug.DebugLog
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.SettingsManager
 import kotlinx.collections.immutable.toImmutableList
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -142,19 +144,38 @@ class WearablesViewModel(application: Application) : AndroidViewModel(applicatio
           }
       if (checkFailed) return@launch
 
-      if (currentStatus == PermissionStatus.Granted) {
-        _uiState.update { it.copy(isStreaming = true) }
-        return@launch
+      if (currentStatus != PermissionStatus.Granted) {
+        // Not granted yet: ask through the Meta AI app
+        val requestedStatus = onRequestWearablesPermission(permission)
+        if (requestedStatus != PermissionStatus.Granted) {
+          setRecentError("Camera permission for the glasses was not granted")
+          return@launch
+        }
       }
 
-      // Not granted yet: ask through the Meta AI app
-      val requestedStatus = onRequestWearablesPermission(permission)
-      if (requestedStatus == PermissionStatus.Granted) {
-        _uiState.update { it.copy(isStreaming = true) }
-      } else {
-        setRecentError("Camera permission for the glasses was not granted")
-      }
+      // Glasses microphone (optional: without it the phone microphone is used)
+      val micGranted = ensureGlassesMicPermission(onRequestWearablesPermission)
+      _uiState.update { it.copy(isStreaming = true, glassesMicGranted = micGranted) }
     }
+  }
+
+  private suspend fun ensureGlassesMicPermission(
+      onRequestWearablesPermission: suspend (Permission) -> PermissionStatus
+  ): Boolean {
+    if (!SettingsManager.glassesMicEnabled) return false
+    var status: PermissionStatus? = null
+    Wearables.checkPermissionStatus(Permission.MICROPHONE)
+        .onSuccess { status = it }
+        .onFailure { error, _ ->
+          DebugLog.log("PERM", "glasses microphone permission check failed: ${error.description}")
+        }
+    if (status == PermissionStatus.Granted) {
+      DebugLog.log("PERM", "glasses microphone permission: already granted")
+      return true
+    }
+    val requested = onRequestWearablesPermission(Permission.MICROPHONE)
+    DebugLog.log("PERM", "glasses microphone permission after asking: $requested")
+    return requested == PermissionStatus.Granted
   }
 
   fun navigateToPhoneMode() {

@@ -57,6 +57,7 @@ fun SettingsScreen(
     var webrtcSignalingURL by remember { mutableStateOf(SettingsManager.webrtcSignalingURL) }
     var videoStreamingEnabled by remember { mutableStateOf(SettingsManager.videoStreamingEnabled) }
     var proactiveNotificationsEnabled by remember { mutableStateOf(SettingsManager.proactiveNotificationsEnabled) }
+    var glassesMicEnabled by remember { mutableStateOf(SettingsManager.glassesMicEnabled) }
     var showResetDialog by remember { mutableStateOf(false) }
     val context = LocalContext.current
 
@@ -70,6 +71,7 @@ fun SettingsScreen(
         SettingsManager.webrtcSignalingURL = webrtcSignalingURL.trim()
         SettingsManager.videoStreamingEnabled = videoStreamingEnabled
         SettingsManager.proactiveNotificationsEnabled = proactiveNotificationsEnabled
+        SettingsManager.glassesMicEnabled = glassesMicEnabled
     }
 
     fun reload() {
@@ -82,6 +84,7 @@ fun SettingsScreen(
         webrtcSignalingURL = SettingsManager.webrtcSignalingURL
         videoStreamingEnabled = SettingsManager.videoStreamingEnabled
         proactiveNotificationsEnabled = SettingsManager.proactiveNotificationsEnabled
+        glassesMicEnabled = SettingsManager.glassesMicEnabled
     }
 
     // The phone's own back gesture also saves (before, only the arrow saved; back closed the app).
@@ -186,6 +189,27 @@ fun SettingsScreen(
                 Switch(
                     checked = videoStreamingEnabled,
                     onCheckedChange = { videoStreamingEnabled = it },
+                )
+            }
+
+            // Microphone
+            SectionHeader("Microphone")
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Use glasses microphone", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "Hears you through the glasses, also with the phone locked. Off = phone microphone.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = glassesMicEnabled,
+                    onCheckedChange = { glassesMicEnabled = it },
                 )
             }
 

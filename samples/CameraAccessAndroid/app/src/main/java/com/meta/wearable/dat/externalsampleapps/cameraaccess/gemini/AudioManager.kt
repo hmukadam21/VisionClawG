@@ -1,13 +1,31 @@
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 
+// AudioManager - speaker output for Gemini's voice, and (optionally) the PHONE microphone.
+//
+// v1.4: playback and capture are separate.
+// - Glasses-mic mode: the user's voice comes from the glasses (DAT SDK audio stream, handled in
+//   StreamViewModel/GeminiSessionViewModel), so only playback runs here, on the "assistant"
+//   route = the glasses' speakers like any media sound.
+// - Phone-mic mode (fallback, phone camera mode, or the setting turned off): the phone's mic is
+//   captured here with VOICE_COMMUNICATION (built-in echo cancellation) and playback uses the
+//   voice-communication route, as before.
+// Diagnostics: loudest mic sample per heartbeat, whether Android silenced the phone mic, and
+// which output/input device each stream is routed to.
+
 import android.annotation.SuppressLint
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.AudioRecordingConfiguration
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.debug.DebugLog
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.SettingsManager
 import java.io.ByteArrayOutputStream
+import kotlin.math.abs
 
 class AudioManager {
     companion object {
@@ -20,33 +38,29 @@ class AudioManager {
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
     private var captureThread: Thread? = null
-    @Volatile
-    private var isCapturing = false
+    @Volatile private var isCapturing = false
+    @Volatile private var isPlaying = false
+    @Volatile private var outputRouteLogged = false
     private val accumulatedData = ByteArrayOutputStream()
     private val accumulateLock = Any()
 
-    @SuppressLint("MissingPermission")
-    fun startCapture() {
-        if (isCapturing) return
+    private var recordingCallback: android.media.AudioManager.AudioRecordingCallback? = null
+    private var lastSilenced: Boolean? = null
 
-        val bufferSize = AudioRecord.getMinBufferSize(
-            GeminiConfig.INPUT_AUDIO_SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
-        )
-
-        audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-            GeminiConfig.INPUT_AUDIO_SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            bufferSize
-        )
-
+    /**
+     * Starts the speaker output for Gemini's voice.
+     * @param forGlassesMic true: "assistant" route (glasses speakers, normal media quality).
+     *                      false: voice-communication route, paired with the phone mic's echo canceller.
+     */
+    fun startPlayback(forGlassesMic: Boolean) {
+        if (audioTrack != null) return
+        val usage =
+            if (forGlassesMic) AudioAttributes.USAGE_ASSISTANT
+            else AudioAttributes.USAGE_VOICE_COMMUNICATION
         audioTrack = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setUsage(usage)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )
@@ -66,10 +80,37 @@ class AudioManager {
                 ) * 2
             )
             .build()
-
-        audioRecord?.startRecording()
         audioTrack?.play()
+        isPlaying = true
+        outputRouteLogged = false
+        DebugLog.log("AUDIO", "speaker output started (${if (forGlassesMic) "assistant/media route" else "voice-call route"})")
+    }
+
+    /** Starts capturing the PHONE microphone (16 kHz mono PCM16). */
+    @SuppressLint("MissingPermission")
+    fun startCapture() {
+        if (isCapturing) return
+
+        val bufferSize = AudioRecord.getMinBufferSize(
+            GeminiConfig.INPUT_AUDIO_SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+
+        val record = AudioRecord(
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            GeminiConfig.INPUT_AUDIO_SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            bufferSize
+        )
+        audioRecord = record
+        registerSilencingWatch()
+
+        record.startRecording()
         isCapturing = true
+        val input = record.routedDevice
+        DebugLog.log("AUDIO", "phone microphone started (input: ${input?.productName ?: "?"}, type ${input?.type ?: "?"})")
 
         synchronized(accumulateLock) {
             accumulatedData.reset()
@@ -77,40 +118,42 @@ class AudioManager {
 
         captureThread = Thread({
             val buffer = ByteArray(bufferSize)
-            var tapCount = 0
             while (isCapturing) {
                 val read = audioRecord?.read(buffer, 0, buffer.size) ?: break
                 if (read > 0) {
-                    tapCount++
+                    DebugLog.notePeak(DebugLog.phoneMicPeak, peakOf(buffer, read))
                     synchronized(accumulateLock) {
                         accumulatedData.write(buffer, 0, read)
                         if (accumulatedData.size() >= MIN_SEND_BYTES) {
                             val chunk = accumulatedData.toByteArray()
                             accumulatedData.reset()
-                            if (tapCount <= 3) {
-                                Log.d(TAG, "Sending chunk: ${chunk.size} bytes (~${chunk.size / 32}ms)")
-                            }
                             onAudioCaptured?.invoke(chunk)
                         }
                     }
                 }
             }
         }, "audio-capture").also { it.start() }
-
-        Log.d(TAG, "Audio capture started (16kHz mono PCM16)")
     }
 
     fun playAudio(data: ByteArray) {
-        if (!isCapturing || data.isEmpty()) return
-        audioTrack?.write(data, 0, data.size)
+        if (!isPlaying || data.isEmpty()) return
+        val track = audioTrack ?: return
+        track.write(data, 0, data.size)
+        if (!outputRouteLogged) {
+            outputRouteLogged = true
+            val out = track.routedDevice
+            DebugLog.log("AUDIO", "Gemini voice playing on: ${out?.productName ?: "?"} (type ${out?.type ?: "?"})")
+        }
     }
 
+    /** Drops any queued speech (used when the user interrupts or on reconnect). */
     fun stopPlayback() {
         audioTrack?.pause()
         audioTrack?.flush()
         audioTrack?.play()
     }
 
+    /** Stops the phone microphone only. */
     fun stopCapture() {
         if (!isCapturing) return
         isCapturing = false
@@ -127,14 +170,64 @@ class AudioManager {
             }
         }
 
+        unregisterSilencingWatch()
         audioRecord?.stop()
         audioRecord?.release()
         audioRecord = null
+        Log.d(TAG, "Audio capture stopped")
+    }
 
+    /** Stops the microphone and the speaker output. */
+    fun stopAll() {
+        stopCapture()
+        isPlaying = false
         audioTrack?.stop()
         audioTrack?.release()
         audioTrack = null
+    }
 
-        Log.d(TAG, "Audio capture stopped")
+    // Loudest absolute 16-bit little-endian sample in the buffer
+    private fun peakOf(buffer: ByteArray, length: Int): Int {
+        var peak = 0
+        var i = 0
+        while (i + 1 < length) {
+            val sample = ((buffer[i].toInt() and 0xFF) or (buffer[i + 1].toInt() shl 8)).toShort().toInt()
+            val a = abs(sample)
+            if (a > peak) peak = a
+            i += 2
+        }
+        return peak
+    }
+
+    // Logs when Android silences (or un-silences) our phone-mic recording, e.g. on screen lock
+    private fun registerSilencingWatch() {
+        val context = SettingsManager.appContext ?: return
+        val systemAudio = context.getSystemService(android.media.AudioManager::class.java) ?: return
+        lastSilenced = null
+        val callback = object : android.media.AudioManager.AudioRecordingCallback() {
+            override fun onRecordingConfigChanged(configs: MutableList<AudioRecordingConfiguration>) {
+                val sessionId = audioRecord?.audioSessionId ?: return
+                val mine = configs.firstOrNull { it.clientAudioSessionId == sessionId } ?: return
+                val silenced = mine.isClientSilenced
+                if (silenced != lastSilenced) {
+                    lastSilenced = silenced
+                    DebugLog.log(
+                        "AUDIO",
+                        if (silenced) "Android SILENCED the phone microphone for this app"
+                        else "phone microphone is live (not silenced)",
+                    )
+                }
+            }
+        }
+        systemAudio.registerAudioRecordingCallback(callback, Handler(Looper.getMainLooper()))
+        recordingCallback = callback
+    }
+
+    private fun unregisterSilencingWatch() {
+        val callback = recordingCallback ?: return
+        val context = SettingsManager.appContext ?: return
+        context.getSystemService(android.media.AudioManager::class.java)
+            ?.unregisterAudioRecordingCallback(callback)
+        recordingCallback = null
     }
 }

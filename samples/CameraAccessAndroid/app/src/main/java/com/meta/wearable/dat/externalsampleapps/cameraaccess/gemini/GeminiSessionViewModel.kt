@@ -8,6 +8,13 @@ package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 // using the session-resumption handle, so the same conversation carries on. The microphone keeps
 // running during the short gap (audio is simply not sent until the link is back).
 // After 6 failed attempts in a row (about 30 seconds), it gives up and shows the error.
+//
+// v1.4: the user's voice comes from the GLASSES microphones (DAT SDK audio stream, forwarded by
+// StreamViewModel via onGlassesAudio) when available. That audio keeps flowing with the phone
+// locked, unlike the phone mic, which Android silences in the background. If no glasses audio
+// arrives within a few seconds, the app falls back to the phone microphone by itself.
+// Echo guard: while Gemini is speaking (plus a short tail) glasses-mic audio is not sent, so
+// Gemini does not hear its own voice from the glasses speakers. (No barge-in in this mode.)
 
 import android.graphics.Bitmap
 import android.util.Log
@@ -46,6 +53,14 @@ class GeminiSessionViewModel : ViewModel() {
 
         // Wait before each reconnect attempt; the list length is the number of attempts.
         private val RECONNECT_DELAYS_MS = longArrayOf(500, 1000, 2000, 4000, 8000, 15000)
+
+        // No glasses audio within this time after connecting -> use the phone microphone
+        private const val GLASSES_AUDIO_WAIT_MS = 4000L
+
+        // Keep the glasses mic muted this long after Gemini's last audio chunk (echo tail)
+        private const val ECHO_TAIL_MS = 800L
+
+        private const val MIN_SEND_BYTES = 3200 // 100 ms at 16 kHz mono PCM16
     }
 
     private val _uiState = MutableStateFlow(GeminiUiState())
@@ -67,6 +82,17 @@ class GeminiSessionViewModel : ViewModel() {
     private var reconnectJob: Job? = null
 
     var streamingMode: StreamingMode = StreamingMode.GLASSES
+
+    // Set by StreamViewModel: true when the glasses stream was opened with microphone audio
+    @Volatile var glassesAudioExpected: Boolean = false
+
+    private enum class MicSource { NONE, GLASSES, PHONE }
+    @Volatile private var micSource = MicSource.NONE
+    @Volatile private var lastGlassesAudioMs = 0L
+    @Volatile private var lastGeminiAudioMs = 0L
+    private val glassesAudioBuffer = java.io.ByteArrayOutputStream()
+    private val glassesAudioLock = Any()
+    private var micWatchdogJob: Job? = null
 
     fun startSession() {
         if (_uiState.value.isGeminiActive) return
@@ -95,6 +121,7 @@ class GeminiSessionViewModel : ViewModel() {
         }
 
         geminiService.onAudioReceived = { data ->
+            lastGeminiAudioMs = System.currentTimeMillis()
             audioManager.playAudio(data)
         }
 
@@ -178,17 +205,36 @@ class GeminiSessionViewModel : ViewModel() {
         }
     }
 
-    /** Starts the microphone (once per conversation) and the optional OpenClaw event stream. */
+    /**
+     * Starts listening (once per conversation): the glasses microphone when the glasses stream
+     * carries audio, otherwise the phone microphone. Also the optional OpenClaw event stream.
+     */
     private fun startMicAndEvents() {
         if (micStarted) return
-        try {
-            audioManager.startCapture()
-            micStarted = true
-            DebugLog.log("AI", "microphone started")
-        } catch (e: Exception) {
-            stopSession("mic failed: ${e.message}")
-            _uiState.value = _uiState.value.copy(errorMessage = "Mic capture failed: ${e.message}")
-            return
+        micStarted = true
+        val useGlasses = streamingMode == StreamingMode.GLASSES &&
+            SettingsManager.glassesMicEnabled && glassesAudioExpected
+        if (useGlasses) {
+            micSource = MicSource.GLASSES
+            DebugLog.micSource = "glasses"
+            audioManager.startPlayback(forGlassesMic = true)
+            DebugLog.log("AI", "listening through the GLASSES microphone")
+            val startedAt = System.currentTimeMillis()
+            micWatchdogJob?.cancel()
+            micWatchdogJob = viewModelScope.launch {
+                delay(GLASSES_AUDIO_WAIT_MS)
+                if (sessionWanted && micSource == MicSource.GLASSES && lastGlassesAudioMs < startedAt) {
+                    DebugLog.log("AI", "no glasses audio after ${GLASSES_AUDIO_WAIT_MS / 1000} s: switching to the PHONE microphone")
+                    switchToPhoneMic()
+                }
+            }
+        } else {
+            DebugLog.log(
+                "AI",
+                "listening through the PHONE microphone (glassesMicSetting=${SettingsManager.glassesMicEnabled}, " +
+                    "glassesAudioExpected=$glassesAudioExpected, mode=$streamingMode)",
+            )
+            if (!switchToPhoneMic()) return
         }
 
         // Connect to OpenClaw event stream for proactive notifications
@@ -201,6 +247,51 @@ class GeminiSessionViewModel : ViewModel() {
             }
             eventClient.connect()
         }
+    }
+
+    /** Phone microphone + voice-call playback route. Returns false if the mic could not start. */
+    private fun switchToPhoneMic(): Boolean {
+        audioManager.stopAll()
+        micSource = MicSource.PHONE
+        DebugLog.micSource = "phone"
+        return try {
+            audioManager.startPlayback(forGlassesMic = false)
+            audioManager.startCapture()
+            DebugLog.log("AI", "phone microphone started")
+            true
+        } catch (e: Exception) {
+            stopSession("mic failed: ${e.message}")
+            _uiState.value = _uiState.value.copy(errorMessage = "Mic capture failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Audio from the glasses microphones (16 kHz mono PCM16), called by StreamViewModel for every
+     * frame of the glasses stream. Sent to Gemini in ~100 ms chunks, except while Gemini speaks.
+     */
+    fun onGlassesAudio(pcm: ByteArray) {
+        lastGlassesAudioMs = System.currentTimeMillis()
+        if (!sessionWanted || micSource != MicSource.GLASSES || pcm.isEmpty()) return
+
+        // Echo guard: Gemini's voice comes out right next to the glasses' microphones
+        if (geminiService.isModelSpeaking.value ||
+            lastGlassesAudioMs - lastGeminiAudioMs < ECHO_TAIL_MS) {
+            DebugLog.audioMutedWhileGeminiSpeaks.incrementAndGet()
+            synchronized(glassesAudioLock) { glassesAudioBuffer.reset() }
+            return
+        }
+
+        DebugLog.micChunks.incrementAndGet()
+        val chunk: ByteArray? = synchronized(glassesAudioLock) {
+            glassesAudioBuffer.write(pcm, 0, pcm.size)
+            if (glassesAudioBuffer.size() >= MIN_SEND_BYTES) {
+                glassesAudioBuffer.toByteArray().also { glassesAudioBuffer.reset() }
+            } else {
+                null
+            }
+        }
+        chunk?.let { geminiService.sendAudio(it) }
     }
 
     private fun onConnectionLost(reason: String) {
@@ -259,8 +350,13 @@ class GeminiSessionViewModel : ViewModel() {
         eventClient.disconnect()
         toolCallRouter?.cancelAll()
         toolCallRouter = null
-        audioManager.stopCapture()
+        micWatchdogJob?.cancel()
+        micWatchdogJob = null
+        audioManager.stopAll()
         micStarted = false
+        micSource = MicSource.NONE
+        DebugLog.micSource = "none"
+        synchronized(glassesAudioLock) { glassesAudioBuffer.reset() }
         geminiService.disconnect()
         geminiService.clearResumption()
         stateObservationJob?.cancel()

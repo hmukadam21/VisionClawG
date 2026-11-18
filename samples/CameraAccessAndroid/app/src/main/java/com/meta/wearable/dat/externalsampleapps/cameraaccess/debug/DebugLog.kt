@@ -21,6 +21,7 @@ import java.util.Locale
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 object DebugLog {
@@ -43,6 +44,19 @@ object DebugLog {
   val audioDroppedNotReady = AtomicLong()
   val audioFromGemini = AtomicLong()
   val picturesSentToGemini = AtomicLong()
+  val glassesAudioFrames = AtomicLong()
+  val audioMutedWhileGeminiSpeaks = AtomicLong()
+  val geminiHeardSpeech = AtomicLong()
+  val transcriptsIn = AtomicLong()
+  // Loudest sample seen since the last heartbeat (0 = pure silence, 32767 = max)
+  val phoneMicPeak = AtomicInteger()
+  val glassesMicPeak = AtomicInteger()
+
+  @Volatile var micSource: String = "none"
+
+  fun notePeak(target: AtomicInteger, peak: Int) {
+    target.accumulateAndGet(peak) { a, b -> if (a > b) a else b }
+  }
 
   fun init(context: Context) {
     if (logFile != null) return
@@ -80,7 +94,11 @@ object DebugLog {
             "mic=${micChunks.getAndSet(0)} audioToGemini=${audioSentToGemini.getAndSet(0)} " +
             "audioDropped=${audioDroppedNotReady.getAndSet(0)} " +
             "audioFromGemini=${audioFromGemini.getAndSet(0)} " +
-            "picturesToGemini=${picturesSentToGemini.getAndSet(0)} | $states",
+            "picturesToGemini=${picturesSentToGemini.getAndSet(0)} " +
+            "glassesAudio=${glassesAudioFrames.getAndSet(0)} mutedEcho=${audioMutedWhileGeminiSpeaks.getAndSet(0)} " +
+            "geminiHeardSpeech=${geminiHeardSpeech.getAndSet(0)} transcripts=${transcriptsIn.getAndSet(0)} " +
+            "peakPhoneMic=${phoneMicPeak.getAndSet(0)} peakGlassesMic=${glassesMicPeak.getAndSet(0)} " +
+            "micSource=$micSource | $states",
     )
   }
 

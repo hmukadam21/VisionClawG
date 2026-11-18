@@ -9,9 +9,20 @@ object SettingsManager {
 
     private lateinit var prefs: SharedPreferences
 
+    // Application context, for system services used outside activities (e.g. audio diagnostics)
+    @Volatile var appContext: Context? = null
+        private set
+
     fun init(context: Context) {
+        appContext = context.applicationContext
         prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
+
+    // Hear the user through the glasses' microphones (via the DAT SDK), which keeps working
+    // with the phone locked. Off = use the phone's microphone.
+    var glassesMicEnabled: Boolean
+        get() = prefs.getBoolean("glassesMicEnabled", true)
+        set(value) = prefs.edit().putBoolean("glassesMicEnabled", value).apply()
 
     var geminiAPIKey: String
         get() = prefs.getString("geminiAPIKey", null) ?: Secrets.geminiAPIKey

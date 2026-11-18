@@ -28,6 +28,8 @@ data class WearablesUiState(
     val hasActiveDevice: Boolean = false,
     val isPhoneMode: Boolean = false,
     val isSettingsVisible: Boolean = false,
+    // The Meta AI app allowed this app to use the glasses' microphones
+    val glassesMicGranted: Boolean = false,
 ) {
   // UNREGISTERING still counts as registered until the Meta AI app confirms (as in Meta's sample).
   val isRegistered: Boolean =

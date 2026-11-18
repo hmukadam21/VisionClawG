@@ -346,6 +346,13 @@ class GeminiLiveService {
                 if (json.length() == 1) return
             }
 
+            // Gemini's own voice detector: it heard the user start speaking
+            if (json.has("voiceActivity")) {
+                val type = json.optJSONObject("voiceActivity")?.optString("type", "") ?: ""
+                if (type == "ACTIVITY_START") DebugLog.geminiHeardSpeech.incrementAndGet()
+                if (json.length() == 1) return
+            }
+
             // GoAway: the server will close this connection soon; the view model reconnects
             if (json.has("goAway")) {
                 val goAway = json.getJSONObject("goAway")
@@ -425,6 +432,7 @@ class GeminiLiveService {
                     val transcription = serverContent.getJSONObject("inputTranscription")
                     val transcriptText = transcription.optString("text", "")
                     if (transcriptText.isNotEmpty()) {
+                        DebugLog.transcriptsIn.incrementAndGet()
                         Log.d(TAG, "You: $transcriptText")
                         lastUserSpeechEnd = System.currentTimeMillis()
                         responseLatencyLogged = false
@@ -442,7 +450,9 @@ class GeminiLiveService {
                 }
             }
             // Anything else: note each new kind of message once (helps spot server errors)
-            val keys = json.keys().asSequence().filter { it != "usageMetadata" && it != "sessionResumptionUpdate" }.toList()
+            val keys = json.keys().asSequence()
+                .filter { it != "usageMetadata" && it != "sessionResumptionUpdate" && it != "voiceActivity" }
+                .toList()
             for (key in keys) {
                 if (key != "serverContent" && loggedUnknownKeys.add(key)) {
                     DebugLog.log("GEMINI", "unhandled message type '$key': ${json.opt(key).toString().take(300)}")
