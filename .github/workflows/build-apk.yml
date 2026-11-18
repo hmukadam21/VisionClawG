@@ -7,6 +7,9 @@ name: Build Android APK
 #   META_PACKAGES_TOKEN  - a GitHub classic token with the read:packages scope,
 #                          used only to download Meta's glasses SDK from GitHub Packages.
 # The Gemini API key is NOT baked in: it is typed into the app's Settings screen.
+#
+# Every run (pass or fail) saves its full log as build-log.txt on the "build-logs"
+# branch, so the whole execution can be read in one place without the Actions UI.
 
 on:
   push:
@@ -24,54 +27,109 @@ jobs:
         working-directory: samples/CameraAccessAndroid
     steps:
       - name: Check out the code
+        id: checkout
         uses: actions/checkout@v4
 
       - name: Set up Java 17
+        id: java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Check the Meta packages token is set
+      - name: Check the Meta packages token
+        id: token
         env:
           META_PACKAGES_TOKEN: ${{ secrets.META_PACKAGES_TOKEN }}
         run: |
-          if [ -z "$META_PACKAGES_TOKEN" ]; then
-            echo "::error::The repository secret META_PACKAGES_TOKEN is missing."
-            exit 1
-          fi
+          {
+            echo "== token check"
+            if [ -z "$META_PACKAGES_TOKEN" ]; then
+              echo "MISSING: the secret META_PACKAGES_TOKEN is empty or not visible to this run"
+              exit 1
+            fi
+            echo "token present, ${#META_PACKAGES_TOKEN} characters, starts with ${META_PACKAGES_TOKEN:0:4}"
+            URL="https://maven.pkg.github.com/facebook/meta-wearables-dat-android/com/meta/wearable/mwdat-core/0.4.0/mwdat-core-0.4.0.pom"
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -u "token:$META_PACKAGES_TOKEN" "$URL")
+            echo "Meta SDK (mwdat-core 0.4.0) download test: HTTP $CODE"
+            if [ "$CODE" != "200" ]; then
+              echo "FAILED: the token cannot download Meta's SDK (401 = bad token or missing read:packages, 404 = version not found)"
+              exit 1
+            fi
+          } 2>&1 | tee -a /tmp/build-log.txt
 
       - name: Create Secrets.kt from the template (placeholders only)
+        id: secrets
         run: |
           D=app/src/main/java/com/meta/wearable/dat/externalsampleapps/cameraaccess
           cp "$D/Secrets.kt.example" "$D/Secrets.kt"
+          echo "== Secrets.kt created from template" | tee -a /tmp/build-log.txt
 
       - name: Build the APK
+        id: build
         env:
           GITHUB_TOKEN: ${{ secrets.META_PACKAGES_TOKEN }}
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --stacktrace --no-daemon
+          echo "== gradle assembleDebug" | tee -a /tmp/build-log.txt
+          ./gradlew assembleDebug --no-daemon --console=plain --stacktrace 2>&1 | tee -a /tmp/build-log.txt
 
       - name: Rename the APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk VisionClaw.apk
+        id: rename
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk VisionClaw.apk
+          ls -l VisionClaw.apk | tee -a /tmp/build-log.txt
 
       - name: Keep the APK as a build artifact
+        id: artifact
         uses: actions/upload-artifact@v4
         with:
           name: VisionClaw-apk
           path: samples/CameraAccessAndroid/VisionClaw.apk
 
       - name: Publish the APK as the "latest-apk" release
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete latest-apk --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
-          gh release create latest-apk VisionClaw.apk \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "VisionClaw APK (latest build)" \
-            --notes "Built from ${GITHUB_SHA::7} on the gemini-direct branch."
+          {
+            echo "== publishing release latest-apk"
+            gh release delete latest-apk --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+            gh release create latest-apk VisionClaw.apk \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "VisionClaw APK (latest build)" \
+              --notes "Built from ${GITHUB_SHA::7} on the gemini-direct branch."
+          } 2>&1 | tee -a /tmp/build-log.txt
+
+      - name: Save the full log to the build-logs branch
+        if: always()
+        working-directory: ${{ github.workspace }}
+        env:
+          PUSH_TOKEN: ${{ github.token }}
+          O_CHECKOUT: ${{ steps.checkout.outcome }}
+          O_JAVA: ${{ steps.java.outcome }}
+          O_TOKEN: ${{ steps.token.outcome }}
+          O_SECRETS: ${{ steps.secrets.outcome }}
+          O_BUILD: ${{ steps.build.outcome }}
+          O_RENAME: ${{ steps.rename.outcome }}
+          O_ARTIFACT: ${{ steps.artifact.outcome }}
+          O_RELEASE: ${{ steps.release.outcome }}
+        run: |
+          REPORT="$RUNNER_TEMP/report.txt"
+          {
+            echo "run #$GITHUB_RUN_NUMBER  commit ${GITHUB_SHA::7}  $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "steps: checkout=$O_CHECKOUT java=$O_JAVA token=$O_TOKEN secrets=$O_SECRETS build=$O_BUILD rename=$O_RENAME artifact=$O_ARTIFACT release=$O_RELEASE"
+            echo "------------------------------------------------------------"
+            if [ -f /tmp/build-log.txt ]; then tail -c 3000000 /tmp/build-log.txt; else echo "(no log written)"; fi
+          } > "$REPORT"
+          LOGDIR="$RUNNER_TEMP/logrepo"
+          rm -rf "$LOGDIR" && mkdir -p "$LOGDIR" && cd "$LOGDIR"
+          git init -q
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          cp "$REPORT" build-log.txt
+          git add build-log.txt
+          git commit -q -m "Build log for run #$GITHUB_RUN_NUMBER (${GITHUB_SHA::7})"
+          git push -q -f "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/build-logs
+          echo "log saved to the build-logs branch"
