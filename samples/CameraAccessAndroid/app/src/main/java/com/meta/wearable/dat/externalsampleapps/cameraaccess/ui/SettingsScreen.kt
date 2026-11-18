@@ -24,6 +24,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -57,7 +59,7 @@ fun SettingsScreen(
     var webrtcSignalingURL by remember { mutableStateOf(SettingsManager.webrtcSignalingURL) }
     var videoStreamingEnabled by remember { mutableStateOf(SettingsManager.videoStreamingEnabled) }
     var proactiveNotificationsEnabled by remember { mutableStateOf(SettingsManager.proactiveNotificationsEnabled) }
-    var glassesMicEnabled by remember { mutableStateOf(SettingsManager.glassesMicEnabled) }
+    var audioMode by remember { mutableStateOf(SettingsManager.audioMode) }
     var showResetDialog by remember { mutableStateOf(false) }
     val context = LocalContext.current
 
@@ -71,7 +73,7 @@ fun SettingsScreen(
         SettingsManager.webrtcSignalingURL = webrtcSignalingURL.trim()
         SettingsManager.videoStreamingEnabled = videoStreamingEnabled
         SettingsManager.proactiveNotificationsEnabled = proactiveNotificationsEnabled
-        SettingsManager.glassesMicEnabled = glassesMicEnabled
+        SettingsManager.audioMode = audioMode
     }
 
     fun reload() {
@@ -84,7 +86,7 @@ fun SettingsScreen(
         webrtcSignalingURL = SettingsManager.webrtcSignalingURL
         videoStreamingEnabled = SettingsManager.videoStreamingEnabled
         proactiveNotificationsEnabled = SettingsManager.proactiveNotificationsEnabled
-        glassesMicEnabled = SettingsManager.glassesMicEnabled
+        audioMode = SettingsManager.audioMode
     }
 
     // The phone's own back gesture also saves (before, only the arrow saved; back closed the app).
@@ -192,25 +194,42 @@ fun SettingsScreen(
                 )
             }
 
-            // Microphone
-            SectionHeader("Microphone")
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("Use glasses microphone", style = MaterialTheme.typography.bodyLarge)
-                    Text(
-                        "Hears you through the glasses, also with the phone locked. Off = phone microphone.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+            // Voice (how you are heard and how Gemini is played)
+            SectionHeader("Voice")
+            val audioOptions = listOf(
+                Triple(
+                    SettingsManager.AUDIO_MODE_BT_CALL,
+                    "Bluetooth call (recommended)",
+                    "Glasses mic and speakers like a phone call. Meant to work with the phone locked.",
+                ),
+                Triple(
+                    SettingsManager.AUDIO_MODE_PHONE,
+                    "Phone microphone",
+                    "Like the first version. Works with the screen on.",
+                ),
+                Triple(
+                    SettingsManager.AUDIO_MODE_GLASSES_SDK,
+                    "Glasses mic (SDK), test only",
+                    "Hears you when locked, but the glasses may mute Gemini's voice.",
+                ),
+            )
+            audioOptions.forEach { (value, title, description) ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .selectable(selected = audioMode == value, onClick = { audioMode = value }),
+                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                ) {
+                    RadioButton(selected = audioMode == value, onClick = { audioMode = value })
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(title, style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            description,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
-                Switch(
-                    checked = glassesMicEnabled,
-                    onCheckedChange = { glassesMicEnabled = it },
-                )
             }
 
             // Notifications

@@ -10,11 +10,16 @@ package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 // - Phone-mic mode (fallback, phone camera mode, or the setting turned off): the phone's mic is
 //   captured here with VOICE_COMMUNICATION (built-in echo cancellation) and playback uses the
 //   voice-communication route, as before.
+// - Bluetooth-call mode (v1.5 default): before the phone-mic path starts, the glasses are made
+//   the "communication device" (Bluetooth HFP, like a phone call), so VOICE_COMMUNICATION capture
+//   uses the glasses' microphones and playback their speakers. This is Meta's documented route
+//   for two-way voice alongside camera streaming. Phone-call audio quality (8 kHz).
 // Diagnostics: loudest mic sample per heartbeat, whether Android silenced the phone mic, and
 // which output/input device each stream is routed to.
 
 import android.annotation.SuppressLint
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.AudioRecordingConfiguration
@@ -47,6 +52,48 @@ class AudioManager {
 
     private var recordingCallback: android.media.AudioManager.AudioRecordingCallback? = null
     private var lastSilenced: Boolean? = null
+    @Volatile private var bluetoothCallActive = false
+
+    /**
+     * Routes call audio to the glasses over Bluetooth HFP (glasses mic + glasses speakers).
+     * Call before startPlayback(forGlassesMic = false) and startCapture().
+     * @return true if the glasses were selected as the communication device.
+     */
+    fun startBluetoothCallRoute(): Boolean {
+        val system = SettingsManager.appContext?.getSystemService(android.media.AudioManager::class.java)
+            ?: return false
+        val devices = system.availableCommunicationDevices
+        DebugLog.log(
+            "AUDIO",
+            "call devices available: " + devices.joinToString { "${it.productName} (type ${it.type})" },
+        )
+        val glasses = devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+            ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
+        if (glasses == null) {
+            DebugLog.log("AUDIO", "no Bluetooth call device found: cannot use the Bluetooth-call route")
+            return false
+        }
+        system.mode = android.media.AudioManager.MODE_IN_COMMUNICATION
+        val ok = system.setCommunicationDevice(glasses)
+        bluetoothCallActive = ok
+        DebugLog.log(
+            "AUDIO",
+            "Bluetooth call route to ${glasses.productName} (type ${glasses.type}): " +
+                if (ok) "ON" else "REFUSED",
+        )
+        if (!ok) system.mode = android.media.AudioManager.MODE_NORMAL
+        return ok
+    }
+
+    private fun stopBluetoothCallRoute() {
+        if (!bluetoothCallActive) return
+        bluetoothCallActive = false
+        val system = SettingsManager.appContext?.getSystemService(android.media.AudioManager::class.java)
+            ?: return
+        system.clearCommunicationDevice()
+        system.mode = android.media.AudioManager.MODE_NORMAL
+        DebugLog.log("AUDIO", "Bluetooth call route OFF")
+    }
 
     /**
      * Starts the speaker output for Gemini's voice.
@@ -81,6 +128,10 @@ class AudioManager {
                 ) * 2
             )
             .build()
+        audioTrack?.addOnRoutingChangedListener({ routing ->
+            val dev = routing.routedDevice
+            DebugLog.log("AUDIO", "speaker output now: ${dev?.productName ?: "?"} (type ${dev?.type ?: "?"})")
+        }, Handler(Looper.getMainLooper()))
         audioTrack?.play()
         isPlaying = true
         outputRouteLogged = false
@@ -121,10 +172,14 @@ class AudioManager {
         audioRecord = record
         registerSilencingWatch()
 
+        record.addOnRoutingChangedListener({ routing ->
+            val dev = routing.routedDevice
+            DebugLog.log("AUDIO", "microphone input now: ${dev?.productName ?: "?"} (type ${dev?.type ?: "?"})")
+        }, Handler(Looper.getMainLooper()))
         record.startRecording()
         isCapturing = true
         val input = record.routedDevice
-        DebugLog.log("AUDIO", "phone microphone started (input: ${input?.productName ?: "?"}, type ${input?.type ?: "?"})")
+        DebugLog.log("AUDIO", "microphone capture started (input: ${input?.productName ?: "?"}, type ${input?.type ?: "?"})")
 
         synchronized(accumulateLock) {
             accumulatedData.reset()
@@ -191,13 +246,14 @@ class AudioManager {
         Log.d(TAG, "Audio capture stopped")
     }
 
-    /** Stops the microphone and the speaker output. */
+    /** Stops the microphone, the speaker output and the Bluetooth call route. */
     fun stopAll() {
         stopCapture()
         isPlaying = false
         audioTrack?.stop()
         audioTrack?.release()
         audioTrack = null
+        stopBluetoothCallRoute()
     }
 
     // Loudest absolute 16-bit little-endian sample in the buffer

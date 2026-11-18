@@ -18,7 +18,14 @@ object GeminiConfig {
     const val VIDEO_JPEG_QUALITY = 50
 
     val systemInstruction: String
-        get() = SettingsManager.geminiSystemPrompt
+        get() = if (isOpenClawConfigured) SettingsManager.geminiSystemPrompt
+        else SettingsManager.geminiSystemPrompt + NO_ACTIONS_NOTE
+
+    // Added while OpenClaw (the "actions" part) is not set up, so Gemini does not try to call,
+    // message or search through a tool that cannot work, and says so plainly instead.
+    private const val NO_ACTIONS_NOTE = """
+
+IMPORTANT, OVERRIDES THE ABOVE: the execute tool is NOT available in this setup. You cannot send messages, make calls, set reminders, save notes or control apps. If the user asks for such an action, say briefly that actions are not set up yet, then help with what you can see and know. Answer the user in the language they speak."""
 
     val apiKey: String
         get() = SettingsManager.geminiAPIKey

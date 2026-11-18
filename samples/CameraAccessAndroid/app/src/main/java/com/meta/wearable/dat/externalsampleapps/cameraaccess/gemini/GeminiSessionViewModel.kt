@@ -214,6 +214,8 @@ class GeminiSessionViewModel : ViewModel() {
         micStarted = true
         val useGlasses = streamingMode == StreamingMode.GLASSES &&
             SettingsManager.glassesMicEnabled && glassesAudioExpected
+        val useBluetoothCall = !useGlasses && streamingMode == StreamingMode.GLASSES &&
+            SettingsManager.audioMode == SettingsManager.AUDIO_MODE_BT_CALL
         if (useGlasses) {
             micSource = MicSource.GLASSES
             DebugLog.micSource = "glasses"
@@ -228,10 +230,13 @@ class GeminiSessionViewModel : ViewModel() {
                     switchToPhoneMic()
                 }
             }
+        } else if (useBluetoothCall) {
+            DebugLog.log("AI", "listening through the glasses as a BLUETOOTH CALL (HFP)")
+            if (!switchToPhoneMic(bluetoothCall = true)) return
         } else {
             DebugLog.log(
                 "AI",
-                "listening through the PHONE microphone (glassesMicSetting=${SettingsManager.glassesMicEnabled}, " +
+                "listening through the PHONE microphone (audioMode=${SettingsManager.audioMode}, " +
                     "glassesAudioExpected=$glassesAudioExpected, mode=$streamingMode)",
             )
             if (!switchToPhoneMic()) return
@@ -249,11 +254,22 @@ class GeminiSessionViewModel : ViewModel() {
         }
     }
 
-    /** Phone microphone + voice-call playback route. Returns false if the mic could not start. */
-    private fun switchToPhoneMic(): Boolean {
+    /**
+     * Microphone capture + voice-call playback. With bluetoothCall=true the glasses are made the
+     * call device first (glasses mic + speakers over HFP); if that fails, the phone mic is used.
+     * Returns false if the mic could not start.
+     */
+    private fun switchToPhoneMic(bluetoothCall: Boolean = false): Boolean {
         audioManager.stopAll()
         micSource = MicSource.PHONE
         DebugLog.micSource = "phone"
+        if (bluetoothCall) {
+            if (audioManager.startBluetoothCallRoute()) {
+                DebugLog.micSource = "bt-call"
+            } else {
+                DebugLog.log("AI", "Bluetooth call route unavailable: using the phone microphone")
+            }
+        }
         return try {
             audioManager.startPlayback(forGlassesMic = false)
             audioManager.startCapture()

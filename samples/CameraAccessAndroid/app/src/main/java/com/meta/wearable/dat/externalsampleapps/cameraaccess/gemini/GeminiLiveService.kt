@@ -289,9 +289,12 @@ class GeminiLiveService {
                         put("text", GeminiConfig.systemInstruction)
                     }))
                 })
-                put("tools", JSONArray().put(JSONObject().apply {
-                    put("functionDeclarations", ToolDeclarations.allDeclarationsJSON())
-                }))
+                // The execute tool only when OpenClaw is set up; otherwise it can only fail
+                if (GeminiConfig.isOpenClawConfigured) {
+                    put("tools", JSONArray().put(JSONObject().apply {
+                        put("functionDeclarations", ToolDeclarations.allDeclarationsJSON())
+                    }))
+                }
                 put("realtimeInputConfig", JSONObject().apply {
                     put("automaticActivityDetection", JSONObject().apply {
                         put("disabled", false)

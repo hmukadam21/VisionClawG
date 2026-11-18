@@ -18,11 +18,22 @@ object SettingsManager {
         prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
-    // Hear the user through the glasses' microphones (via the DAT SDK), which keeps working
-    // with the phone locked. Off = use the phone's microphone.
-    var glassesMicEnabled: Boolean
-        get() = prefs.getBoolean("glassesMicEnabled", true)
-        set(value) = prefs.edit().putBoolean("glassesMicEnabled", value).apply()
+    // How the user's voice is heard and Gemini's voice is played (glasses mode):
+    //  AUDIO_MODE_BT_CALL     glasses mic + glasses speakers as a Bluetooth call (HFP), Meta's
+    //                         documented route for two-way voice next to camera streaming
+    //  AUDIO_MODE_PHONE       phone mic, voice to the glasses as before (v1.1-v1.3 behaviour)
+    //  AUDIO_MODE_GLASSES_SDK glasses mic via the DAT camera stream + media speaker (v1.4)
+    const val AUDIO_MODE_BT_CALL = "bt_call"
+    const val AUDIO_MODE_PHONE = "phone"
+    const val AUDIO_MODE_GLASSES_SDK = "glasses_sdk"
+
+    var audioMode: String
+        get() = prefs.getString("audioMode", null) ?: AUDIO_MODE_BT_CALL
+        set(value) = prefs.edit().putString("audioMode", value).apply()
+
+    /** True when the glasses mic comes through the DAT camera stream (AUDIO_MODE_GLASSES_SDK). */
+    val glassesMicEnabled: Boolean
+        get() = audioMode == AUDIO_MODE_GLASSES_SDK
 
     var geminiAPIKey: String
         get() = prefs.getString("geminiAPIKey", null) ?: Secrets.geminiAPIKey
