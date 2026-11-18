@@ -4,8 +4,9 @@ package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 //
 // v1.4: playback and capture are separate.
 // - Glasses-mic mode: the user's voice comes from the glasses (DAT SDK audio stream, handled in
-//   StreamViewModel/GeminiSessionViewModel), so only playback runs here, on the "assistant"
-//   route = the glasses' speakers like any media sound.
+//   StreamViewModel/GeminiSessionViewModel), so only playback runs here, as MEDIA audio = the
+//   glasses' speakers, exactly like Meta's BirdSpotter sample. (v1.4 used the "assistant" usage,
+//   which was routed to the glasses but could not be heard: on some phones it has its own volume.)
 // - Phone-mic mode (fallback, phone camera mode, or the setting turned off): the phone's mic is
 //   captured here with VOICE_COMMUNICATION (built-in echo cancellation) and playback uses the
 //   voice-communication route, as before.
@@ -49,13 +50,13 @@ class AudioManager {
 
     /**
      * Starts the speaker output for Gemini's voice.
-     * @param forGlassesMic true: "assistant" route (glasses speakers, normal media quality).
+     * @param forGlassesMic true: media route (glasses speakers, normal media quality).
      *                      false: voice-communication route, paired with the phone mic's echo canceller.
      */
     fun startPlayback(forGlassesMic: Boolean) {
         if (audioTrack != null) return
         val usage =
-            if (forGlassesMic) AudioAttributes.USAGE_ASSISTANT
+            if (forGlassesMic) AudioAttributes.USAGE_MEDIA
             else AudioAttributes.USAGE_VOICE_COMMUNICATION
         audioTrack = AudioTrack.Builder()
             .setAudioAttributes(
@@ -83,7 +84,20 @@ class AudioManager {
         audioTrack?.play()
         isPlaying = true
         outputRouteLogged = false
-        DebugLog.log("AUDIO", "speaker output started (${if (forGlassesMic) "assistant/media route" else "voice-call route"})")
+        val system = SettingsManager.appContext?.getSystemService(android.media.AudioManager::class.java)
+        val media = system?.let {
+            "${it.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)}/" +
+                "${it.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)}"
+        }
+        val call = system?.let {
+            "${it.getStreamVolume(android.media.AudioManager.STREAM_VOICE_CALL)}/" +
+                "${it.getStreamMaxVolume(android.media.AudioManager.STREAM_VOICE_CALL)}"
+        }
+        DebugLog.log(
+            "AUDIO",
+            "speaker output started (${if (forGlassesMic) "media route" else "voice-call route"}), " +
+                "volumes: media=$media call=$call, audio mode=${system?.mode}",
+        )
     }
 
     /** Starts capturing the PHONE microphone (16 kHz mono PCM16). */
