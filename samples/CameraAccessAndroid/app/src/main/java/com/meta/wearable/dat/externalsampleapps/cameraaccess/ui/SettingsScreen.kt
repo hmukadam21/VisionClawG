@@ -1,5 +1,6 @@
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -75,6 +76,12 @@ fun SettingsScreen(
         webrtcSignalingURL = SettingsManager.webrtcSignalingURL
         videoStreamingEnabled = SettingsManager.videoStreamingEnabled
         proactiveNotificationsEnabled = SettingsManager.proactiveNotificationsEnabled
+    }
+
+    // The phone's own back gesture also saves (before, only the arrow saved; back closed the app).
+    BackHandler {
+        save()
+        onBack()
     }
 
     Column(modifier = modifier.fillMaxSize()) {
