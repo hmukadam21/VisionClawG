@@ -19,6 +19,14 @@
 // stream flowing when the phone is locked or the app is in the background, while a raw stream
 // pauses. GlassesFrameDecoder turns the HEVC frames back into Bitmaps (a few per second), which
 // are shown on screen and forwarded to Gemini (~1 per second) and WebRTC.
+//
+// On-demand camera (v1.6, the default): like Meta AI, the camera is OFF. The glasses session is
+// opened without a camera. When Gemini calls look_through_glasses (or the photo button is
+// tapped), lookNow() adds a camera, starts a small stream (the SDK's photo rides a running
+// stream), takes ONE photo with stream.capturePhoto(), and switches the camera off again.
+// If the session ends meanwhile (glasses folded, link lost), the voice carries on and the next
+// look opens a new session. In live mode the same tool takes a sharp photo from the running
+// stream, falling back to the newest video picture.
 
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.stream
 
@@ -30,6 +38,7 @@ import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.FileProvider
 import androidx.exifinterface.media.ExifInterface
@@ -54,7 +63,9 @@ import com.meta.wearable.dat.core.selectors.DeviceSelector
 import com.meta.wearable.dat.core.session.DeviceSession
 import com.meta.wearable.dat.core.session.DeviceSessionState
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.debug.DebugLog
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini.GeminiConfig
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini.GeminiSessionViewModel
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini.LookResult
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.phone.PhoneCameraManager
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.SettingsManager
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.wearables.WearablesViewModel
@@ -64,14 +75,21 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 class StreamViewModel(
     application: Application,
@@ -89,6 +107,16 @@ class StreamViewModel(
     // Decoded pictures turned into Bitmaps at most every 250 ms (~4 per second) for the on-screen
     // preview; Gemini takes one per second of those (throttled in GeminiSessionViewModel).
     private const val PICTURE_INTERVAL_MS = 250L
+
+    // On-demand look: waits (the photo itself took about 1 s in Meta's own sample app)
+    private const val SESSION_START_TIMEOUT_MS = 10_000L
+    private const val CAMERA_START_TIMEOUT_MS = 10_000L
+    private const val PHOTO_TIMEOUT_MS = 15_000L
+    private const val CAMERA_STOP_TIMEOUT_MS = 3_000L
+    private const val FRAME_FALLBACK_WAIT_MS = 1_500L
+
+    // Photos are decoded at no more than about this size (a full photo would be ~48 MB in memory)
+    private const val KEEP_MAX_EDGE = 2048
   }
 
   private val deviceSelector: DeviceSelector = wearablesViewModel.deviceSelector
@@ -117,8 +145,25 @@ class StreamViewModel(
   // are not treated as "the glasses went away".
   private var stopping = false
 
+  // Camera mode of the current run (read from Settings when the stream starts)
+  @Volatile private var onDemand = false
+  private val sessionState = MutableStateFlow<DeviceSessionState?>(null)
+
+  // On-demand look: one at a time; the previous camera is fully off before the next one
+  private val lookMutex = Mutex()
+  @Volatile private var lookCamera: Camera? = null
+  @Volatile private var lookDecoder: GlassesFrameDecoder? = null
+  @Volatile private var lastLookFrame: Bitmap? = null
+  private val lookCameraJobs = mutableListOf<Job>()
+  @Volatile private var lookTeardownJob: Job? = null
+
   // VisionClaw additions
   var geminiViewModel: GeminiSessionViewModel? = null
+    set(value) {
+      field = value
+      // Gemini's look_through_glasses tool takes its photo here
+      value?.lookProvider = { lookNow() }
+    }
   var webrtcViewModel: WebRTCSessionViewModel? = null
   private var phoneCameraManager: PhoneCameraManager? = null
 
@@ -147,6 +192,7 @@ class StreamViewModel(
             val gemini = geminiViewModel?.uiState?.value
             DebugLog.heartbeat(
                 "stream=${_uiState.value.streamSessionState} mode=${_uiState.value.streamingMode} " +
+                    "camera=${if (onDemand) "on-demand" else "live"} session=${sessionState.value} " +
                     "geminiActive=${gemini?.isGeminiActive} gemini=${gemini?.connectionState}"
             )
           }
@@ -158,26 +204,53 @@ class StreamViewModel(
   fun startStream() {
     stopStream("starting a new stream")
     stopping = false
-    DebugLog.log("STREAM", "starting glasses session")
+    onDemand = SettingsManager.cameraOnDemand
+    DebugLog.log(
+        "STREAM",
+        "starting glasses session (camera ${if (onDemand) "ON DEMAND" else "LIVE"})",
+    )
     startHeartbeat()
 
     // Foreground service keeps glasses link + microphone alive while the screen is off
     StreamingService.start(getApplication())
     _uiState.update {
-      it.copy(streamingMode = StreamingMode.GLASSES, streamSessionState = StreamState.STARTING)
+      it.copy(
+          streamingMode = StreamingMode.GLASSES,
+          streamSessionState = StreamState.STARTING,
+          cameraOnDemand = onDemand,
+      )
     }
 
+    if (!openSession()) leaveStreaming("createSession failed")
+  }
+
+  /** Creates and starts a glasses session (state arrives in observeSession). */
+  private fun openSession(): Boolean {
+    var opened = false
     Wearables.createSession(deviceSelector)
         .onSuccess { created ->
           session = created
           // Subscribe before start() so no state change is missed
           observeSession(created)
           created.start()
+          opened = true
         }
         .onFailure { error, _ ->
           DebugLog.log("STREAM", "createSession FAILED: ${error.description}")
-          failAndLeave("Could not connect to the glasses: ${error.description}")
+          wearablesViewModel.setRecentError("Could not connect to the glasses: ${error.description}")
         }
+    return opened
+  }
+
+  /** Stops the glasses session and forgets it (the on-demand look opens a new one). */
+  private fun closeSession() {
+    sessionStateJob?.cancel()
+    sessionStateJob = null
+    sessionErrorJob?.cancel()
+    sessionErrorJob = null
+    runCatching { session?.stop() }.onFailure { Log.w(TAG, "session stop failed", it) }
+    session = null
+    sessionState.value = null
   }
 
   private fun observeSession(currentSession: DeviceSession) {
@@ -185,11 +258,30 @@ class StreamViewModel(
         viewModelScope.launch {
           currentSession.state.collect { state ->
             DebugLog.log("STREAM", "glasses session state: $state")
+            sessionState.value = state
             when (state) {
-              // A camera can only be added once the session is STARTED
-              DeviceSessionState.STARTED -> attachCamera(currentSession)
+              DeviceSessionState.STARTED ->
+                  if (onDemand) {
+                    // Camera stays off until a look
+                    if (lookCamera == null) {
+                      _uiState.update { it.copy(streamSessionState = StreamState.STOPPED) }
+                    }
+                    DebugLog.log("STREAM", "glasses ready, camera off until Gemini needs to look")
+                  } else {
+                    // A camera can only be added once the session is STARTED
+                    attachCamera(currentSession)
+                  }
               // STOPPED is terminal (the glasses were removed, folded, disconnected, ...)
-              DeviceSessionState.STOPPED -> if (!stopping) leaveStreaming("glasses session stopped")
+              DeviceSessionState.STOPPED ->
+                  if (!stopping) {
+                    if (onDemand) {
+                      // The voice carries on; the next look opens a new session
+                      _uiState.update { it.copy(streamSessionState = StreamState.STOPPED) }
+                      DebugLog.log("STREAM", "glasses session ended; the next look reconnects")
+                    } else {
+                      leaveStreaming("glasses session stopped")
+                    }
+                  }
               else -> Unit
             }
           }
@@ -294,6 +386,7 @@ class StreamViewModel(
   // MARK: - Phone camera mode (unchanged)
 
   fun startPhoneCamera(lifecycleOwner: LifecycleOwner) {
+    onDemand = false
     val manager = PhoneCameraManager(getApplication())
     phoneCameraManager = manager
 
@@ -344,12 +437,16 @@ class StreamViewModel(
     frameDecoder?.release()
     frameDecoder = null
 
+    // On-demand look camera, if one is on right now
+    lookTeardownJob?.cancel()
+    lookTeardownJob = null
+    releaseLookCamera()
+
     // Closing the camera stops its stream; stopping the session releases the glasses.
     runCatching { camera?.close() }.onFailure { Log.w(TAG, "camera close failed", it) }
     camera = null
     stream = null
-    runCatching { session?.stop() }.onFailure { Log.w(TAG, "session stop failed", it) }
-    session = null
+    closeSession()
 
     phoneCameraManager?.stop()
     phoneCameraManager = null
@@ -361,6 +458,31 @@ class StreamViewModel(
   fun capturePhoto() {
     if (uiState.value.isCapturing) {
       Log.d(TAG, "Photo capture already in progress, ignoring request")
+      return
+    }
+
+    // On-demand camera: the photo button takes one look, then offers to share it
+    if (onDemand && uiState.value.streamingMode == StreamingMode.GLASSES) {
+      _uiState.update { it.copy(isCapturing = true) }
+      viewModelScope.launch {
+        DebugLog.log("LOOK", "photo button tapped")
+        when (val result = lookNow()) {
+          is LookResult.Photo ->
+              _uiState.update {
+                it.copy(
+                    isCapturing = false,
+                    capturedPhoto = result.bitmap,
+                    isShareDialogVisible = true,
+                )
+              }
+          is LookResult.Failed -> {
+            DebugLog.looksFailed.incrementAndGet()
+            DebugLog.log("LOOK", "photo button look FAILED: ${result.reason}")
+            _uiState.update { it.copy(isCapturing = false) }
+            wearablesViewModel.setRecentError("Photo failed: ${result.reason}")
+          }
+        }
+      }
       return
     }
 
@@ -397,6 +519,242 @@ class StreamViewModel(
           "Cannot capture photo: stream not active (state=${uiState.value.streamSessionState})",
       )
     }
+  }
+
+  // MARK: - Look (one sharp photo for Gemini: look_through_glasses)
+
+  /** Takes one sharp photo through the glasses. Never throws; failures come back as Failed. */
+  suspend fun lookNow(): LookResult =
+      lookMutex.withLock {
+        DebugLog.looks.incrementAndGet()
+        // The previous look's camera must be fully off before a new one is added
+        lookTeardownJob?.join()
+        when {
+          _uiState.value.streamingMode == StreamingMode.PHONE ->
+              _uiState.value.videoFrame?.let { LookResult.Photo(it) }
+                  ?: LookResult.Failed("no picture from the phone camera yet")
+          !onDemand -> liveLook()
+          else -> onDemandLook()
+        }
+      }
+
+  /** Live mode: a photo from the running stream, or else the newest video picture. */
+  private suspend fun liveLook(): LookResult {
+    val currentStream = stream
+    if (currentStream != null && _uiState.value.streamSessionState == StreamState.STREAMING) {
+      takeStreamPhoto(currentStream)?.let { return LookResult.Photo(it) }
+    }
+    val frame = _uiState.value.videoFrame ?: return LookResult.Failed("no picture from the glasses yet")
+    DebugLog.log("LOOK", "using the newest video picture instead (${frame.width}x${frame.height})")
+    return LookResult.Photo(frame)
+  }
+
+  /** On-demand mode: camera on, one photo, camera off (switched off in the background). */
+  private suspend fun onDemandLook(): LookResult {
+    val startedAt = SystemClock.elapsedRealtime()
+    _uiState.update { it.copy(isLooking = true) }
+    try {
+      val currentSession =
+          ensureSessionStarted() ?: return LookResult.Failed("the glasses are not connected")
+      val sessionMs = SystemClock.elapsedRealtime() - startedAt
+
+      val lookStream = startLookCamera(currentSession)
+          ?: return LookResult.Failed("the glasses camera could not be switched on")
+      DebugLog.log(
+          "LOOK",
+          "camera on after ${SystemClock.elapsedRealtime() - startedAt} ms (glasses ready after $sessionMs ms)",
+      )
+
+      val photo = takeStreamPhoto(lookStream)
+      if (photo != null) {
+        _uiState.update { it.copy(videoFrame = photo) }
+        DebugLog.log("LOOK", "look done in ${SystemClock.elapsedRealtime() - startedAt} ms")
+        return LookResult.Photo(photo)
+      }
+
+      // No photo: the small video picture is better than nothing
+      val frame =
+          lastLookFrame
+              ?: withTimeoutOrNull(FRAME_FALLBACK_WAIT_MS) {
+                while (lastLookFrame == null) delay(100)
+                lastLookFrame
+              }
+      return if (frame != null) {
+        DebugLog.log("LOOK", "using a video picture instead (${frame.width}x${frame.height})")
+        LookResult.Photo(frame)
+      } else {
+        LookResult.Failed("the photo did not arrive from the glasses")
+      }
+    } finally {
+      _uiState.update { it.copy(isLooking = false) }
+      // Camera off in the background so Gemini gets the photo without waiting for it
+      if (lookCamera != null) lookTeardownJob = viewModelScope.launch { switchOffLookCamera() }
+    }
+  }
+
+  /** The glasses session, (re)opened if needed and STARTED, or null. */
+  private suspend fun ensureSessionStarted(): DeviceSession? {
+    val state = sessionState.value
+    if (session == null ||
+        state == DeviceSessionState.STOPPED ||
+        state == DeviceSessionState.STOPPING) {
+      DebugLog.log("LOOK", "opening a new glasses session (was $state)")
+      closeSession()
+      if (!openSession()) return null
+    }
+    val started =
+        withTimeoutOrNull(SESSION_START_TIMEOUT_MS) {
+          sessionState.first { it == DeviceSessionState.STARTED }
+        }
+    if (started == null) {
+      DebugLog.log("LOOK", "glasses session not ready after ${SESSION_START_TIMEOUT_MS / 1000} s (${sessionState.value})")
+      return null
+    }
+    return session
+  }
+
+  /** Adds a camera with a small stream and waits until it is STREAMING. Returns the stream. */
+  private suspend fun startLookCamera(currentSession: DeviceSession): Stream? {
+    var added: Camera? = null
+    var addError: String? = null
+    // Small stream: the photo rides it, and a small stream leaves the link to the photo
+    val config =
+        StreamConfiguration(videoQuality = VideoQuality.LOW, frameRate = FRAME_RATE, compressVideo = true)
+    currentSession.addCamera(config).onSuccess { added = it }.onFailure { e, _ -> addError = e.description }
+    if (added == null) {
+      // The previous camera may still be detaching: one more try a moment later
+      DebugLog.log("LOOK", "addCamera failed ($addError), trying again in 1 s")
+      delay(1_000)
+      addError = null
+      currentSession.addCamera(config).onSuccess { added = it }.onFailure { e, _ -> addError = e.description }
+    }
+    val cam = added
+    if (cam == null) {
+      DebugLog.log("LOOK", "addCamera FAILED: $addError")
+      return null
+    }
+    lookCamera = cam
+    val lookStream = cam.stream
+
+    lastLookFrame = null
+    val decoder = GlassesFrameDecoder(PICTURE_INTERVAL_MS) { bitmap ->
+      lastLookFrame = bitmap
+      _uiState.update { it.copy(videoFrame = bitmap) }
+    }
+    lookDecoder = decoder
+    synchronized(lookCameraJobs) {
+      lookCameraJobs +=
+          viewModelScope.launch(frameDispatcher) {
+            lookStream.videoStream.collect { frame ->
+              DebugLog.glassesFrames.incrementAndGet()
+              if (frame.isCompressed) decoder.decode(frame)
+            }
+          }
+      lookCameraJobs +=
+          viewModelScope.launch {
+            lookStream.state.collect { state ->
+              DebugLog.log("LOOK", "camera state: $state")
+              _uiState.update { it.copy(streamSessionState = state) }
+            }
+          }
+      lookCameraJobs +=
+          viewModelScope.launch {
+            lookStream.errorStream.collect { DebugLog.log("LOOK", "camera error: ${it.description}") }
+          }
+    }
+
+    // Subscribe before start() so STREAMING is not missed
+    val streaming = viewModelScope.async { lookStream.state.first { it == StreamState.STREAMING } }
+    val reached =
+        try {
+          var startError: String? = null
+          lookStream.start().onFailure { e, _ -> startError = e.description }
+          if (startError != null) {
+            DebugLog.log("LOOK", "camera start FAILED: $startError")
+            return null
+          }
+          withTimeoutOrNull(CAMERA_START_TIMEOUT_MS) { streaming.await() }
+        } finally {
+          streaming.cancel()
+        }
+    if (reached == null) {
+      DebugLog.log("LOOK", "camera not streaming after ${CAMERA_START_TIMEOUT_MS / 1000} s")
+      return null
+    }
+    return lookStream
+  }
+
+  /** One photo from a running stream (Meta's stream.capturePhoto), decoded, or null. */
+  private suspend fun takeStreamPhoto(currentStream: Stream): Bitmap? {
+    val startedAt = SystemClock.elapsedRealtime()
+    val arrival = CompletableDeferred<PhotoData?>()
+    val ask =
+        viewModelScope.launch {
+          currentStream
+              .capturePhoto()
+              .onSuccess { arrival.complete(it) }
+              .onFailure { error, _ ->
+                DebugLog.log("LOOK", "photo FAILED: ${error.description}")
+                arrival.complete(null)
+              }
+        }
+    val data =
+        try {
+          withTimeoutOrNull(PHOTO_TIMEOUT_MS) { arrival.await() }
+        } finally {
+          ask.cancel()
+        }
+    val elapsed = SystemClock.elapsedRealtime() - startedAt
+    if (data == null) {
+      DebugLog.log("LOOK", "no photo after $elapsed ms")
+      return null
+    }
+    val (bitmap, description) = withContext(Dispatchers.Default) { decodePhoto(data) }
+    DebugLog.log(
+        "LOOK",
+        "photo arrived in $elapsed ms: $description -> " +
+            (bitmap?.let { "${it.width}x${it.height}" } ?: "could not be decoded"),
+    )
+    return bitmap
+  }
+
+  /** Stops the look camera and waits until it is really off (so the next addCamera works). */
+  private suspend fun switchOffLookCamera() {
+    val cam = lookCamera ?: return
+    val startedAt = SystemClock.elapsedRealtime()
+    val stopped =
+        viewModelScope.async {
+          cam.stream.state.first { it == StreamState.STOPPED || it == StreamState.CLOSED }
+        }
+    val off =
+        try {
+          runCatching { cam.stop() }.onFailure { Log.w(TAG, "look camera stop failed", it) }
+          withTimeoutOrNull(CAMERA_STOP_TIMEOUT_MS) { stopped.await() }
+        } finally {
+          stopped.cancel()
+          releaseLookCamera()
+        }
+    DebugLog.log(
+        "LOOK",
+        "camera off after ${SystemClock.elapsedRealtime() - startedAt} ms" +
+            if (off == null) " (did not confirm, closed anyway)" else "",
+    )
+    if (onDemand && session != null) {
+      _uiState.update { it.copy(streamSessionState = StreamState.STOPPED) }
+    }
+  }
+
+  /** Closes the look camera at once and drops its collectors and decoder. */
+  private fun releaseLookCamera() {
+    val cam = lookCamera
+    lookCamera = null
+    synchronized(lookCameraJobs) {
+      lookCameraJobs.forEach { it.cancel() }
+      lookCameraJobs.clear()
+    }
+    runCatching { cam?.close() }.onFailure { Log.w(TAG, "look camera close failed", it) }
+    lookDecoder?.release()
+    lookDecoder = null
   }
 
   fun showShareDialog() {
@@ -522,20 +880,8 @@ class StreamViewModel(
   // MARK: - Photo decoding
 
   private fun handlePhotoData(photo: PhotoData) {
-    val capturedPhoto =
-        when (photo) {
-          is PhotoData.Bitmap -> photo.bitmap
-          is PhotoData.HEIC -> {
-            val data = photo.data.duplicate().apply { rewind() }
-            val byteArray = ByteArray(data.remaining())
-            data.get(byteArray)
-
-            // Extract EXIF transformation matrix and apply to bitmap
-            val exifInfo = getExifInfo(byteArray)
-            val transform = getTransform(exifInfo)
-            decodeHeic(byteArray, transform)
-          }
-        }
+    val (capturedPhoto, description) = decodePhoto(photo)
+    DebugLog.log("STREAM", "photo button: $description")
     if (capturedPhoto == null) {
       wearablesViewModel.setRecentError("Could not read the photo from the glasses")
       return
@@ -543,11 +889,51 @@ class StreamViewModel(
     _uiState.update { it.copy(capturedPhoto = capturedPhoto, isShareDialogVisible = true) }
   }
 
-  // HEIC decoding with EXIF transformation
-  private fun decodeHeic(heicBytes: ByteArray, transform: Matrix): Bitmap? {
-    val bitmap = BitmapFactory.decodeByteArray(heicBytes, 0, heicBytes.size) ?: return null
-    return applyTransform(bitmap, transform)
-  }
+  /**
+   * Decodes a glasses photo (a Bitmap, or HEIC with its EXIF rotation applied) to at most about
+   * KEEP_MAX_EDGE, still above the size sent to Gemini. Returns the picture (or null) and a short
+   * description of what arrived, for the log.
+   */
+  private fun decodePhoto(photo: PhotoData): Pair<Bitmap?, String> =
+      when (photo) {
+        is PhotoData.Bitmap -> {
+          val original = photo.bitmap
+          val longEdge = maxOf(original.width, original.height)
+          val bitmap =
+              if (longEdge > KEEP_MAX_EDGE) {
+                val factor = KEEP_MAX_EDGE.toFloat() / longEdge
+                Bitmap.createScaledBitmap(
+                    original,
+                    (original.width * factor).toInt().coerceAtLeast(1),
+                    (original.height * factor).toInt().coerceAtLeast(1),
+                    true,
+                )
+              } else {
+                original
+              }
+          Pair(bitmap, "bitmap ${original.width}x${original.height}")
+        }
+        is PhotoData.HEIC -> {
+          val data = photo.data.duplicate().apply { rewind() }
+          val bytes = ByteArray(data.remaining())
+          data.get(bytes)
+          // Read the size first, then decode at a reduced size (powers of 2) to save memory
+          val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+          BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+          val longEdge = maxOf(bounds.outWidth, bounds.outHeight)
+          var sample = 1
+          while (longEdge / (sample * 2) >= GeminiConfig.PHOTO_MAX_EDGE) sample *= 2
+          val decoded =
+              BitmapFactory.decodeByteArray(
+                  bytes,
+                  0,
+                  bytes.size,
+                  BitmapFactory.Options().apply { inSampleSize = sample },
+              )
+          val bitmap = decoded?.let { applyTransform(it, getTransform(getExifInfo(bytes))) }
+          Pair(bitmap, "HEIC ${bounds.outWidth}x${bounds.outHeight}, ${bytes.size / 1024} KB")
+        }
+      }
 
   private fun getExifInfo(heicBytes: ByteArray): ExifInterface? {
     return try {

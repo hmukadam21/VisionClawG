@@ -66,9 +66,20 @@ object SettingsManager {
         get() = prefs.getString("webrtcSignalingURL", null) ?: Secrets.webrtcSignalingURL
         set(value) = prefs.edit().putString("webrtcSignalingURL", value).apply()
 
-    var videoStreamingEnabled: Boolean
-        get() = prefs.getBoolean("videoStreamingEnabled", true)
-        set(value) = prefs.edit().putBoolean("videoStreamingEnabled", value).apply()
+    // When the glasses camera runs (v1.6):
+    //  CAMERA_ON_DEMAND  camera off; Gemini takes one sharp photo when a question needs eyes
+    //                    (the look_through_glasses tool), like Meta AI
+    //  CAMERA_LIVE       camera always on, Gemini watches the live video (1 picture per second)
+    const val CAMERA_ON_DEMAND = "on_demand"
+    const val CAMERA_LIVE = "live"
+
+    var cameraMode: String
+        get() = prefs.getString("cameraMode", null) ?: CAMERA_ON_DEMAND
+        set(value) = prefs.edit().putString("cameraMode", value).apply()
+
+    /** On-demand camera, except in the SDK-mic test mode, whose audio rides the live stream. */
+    val cameraOnDemand: Boolean
+        get() = cameraMode != CAMERA_LIVE && audioMode != AUDIO_MODE_GLASSES_SDK
 
     var proactiveNotificationsEnabled: Boolean
         get() = prefs.getBoolean("proactiveNotificationsEnabled", true)

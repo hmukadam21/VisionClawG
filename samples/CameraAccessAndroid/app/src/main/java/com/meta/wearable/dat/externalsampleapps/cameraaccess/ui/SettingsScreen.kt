@@ -57,7 +57,7 @@ fun SettingsScreen(
     var openClawHookToken by remember { mutableStateOf(SettingsManager.openClawHookToken) }
     var openClawGatewayToken by remember { mutableStateOf(SettingsManager.openClawGatewayToken) }
     var webrtcSignalingURL by remember { mutableStateOf(SettingsManager.webrtcSignalingURL) }
-    var videoStreamingEnabled by remember { mutableStateOf(SettingsManager.videoStreamingEnabled) }
+    var cameraMode by remember { mutableStateOf(SettingsManager.cameraMode) }
     var proactiveNotificationsEnabled by remember { mutableStateOf(SettingsManager.proactiveNotificationsEnabled) }
     var audioMode by remember { mutableStateOf(SettingsManager.audioMode) }
     var showResetDialog by remember { mutableStateOf(false) }
@@ -71,7 +71,7 @@ fun SettingsScreen(
         SettingsManager.openClawHookToken = openClawHookToken.trim()
         SettingsManager.openClawGatewayToken = openClawGatewayToken.trim()
         SettingsManager.webrtcSignalingURL = webrtcSignalingURL.trim()
-        SettingsManager.videoStreamingEnabled = videoStreamingEnabled
+        SettingsManager.cameraMode = cameraMode
         SettingsManager.proactiveNotificationsEnabled = proactiveNotificationsEnabled
         SettingsManager.audioMode = audioMode
     }
@@ -84,7 +84,7 @@ fun SettingsScreen(
         openClawHookToken = SettingsManager.openClawHookToken
         openClawGatewayToken = SettingsManager.openClawGatewayToken
         webrtcSignalingURL = SettingsManager.webrtcSignalingURL
-        videoStreamingEnabled = SettingsManager.videoStreamingEnabled
+        cameraMode = SettingsManager.cameraMode
         proactiveNotificationsEnabled = SettingsManager.proactiveNotificationsEnabled
         audioMode = SettingsManager.audioMode
     }
@@ -173,26 +173,24 @@ fun SettingsScreen(
                 keyboardType = KeyboardType.Uri,
             )
 
-            // Video
-            SectionHeader("Video")
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-            ) {
-                Column {
-                    Text("Video Streaming", style = MaterialTheme.typography.bodyLarge)
-                    Text(
-                        "Disable to save battery. Audio remains active.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                Switch(
-                    checked = videoStreamingEnabled,
-                    onCheckedChange = { videoStreamingEnabled = it },
-                )
-            }
+            // Camera (when the glasses camera runs)
+            SectionHeader("Camera")
+            ChoiceList(
+                options = listOf(
+                    Triple(
+                        SettingsManager.CAMERA_ON_DEMAND,
+                        "Only when needed (recommended)",
+                        "Camera stays off. When your question needs eyes, Gemini takes one sharp photo, like Meta AI.",
+                    ),
+                    Triple(
+                        SettingsManager.CAMERA_LIVE,
+                        "Live video",
+                        "Camera always on and Gemini watches all the time. More battery, less sharp.",
+                    ),
+                ),
+                selected = cameraMode,
+                onSelect = { cameraMode = it },
+            )
 
             // Voice (how you are heard and how Gemini is played)
             SectionHeader("Voice")
@@ -210,27 +208,10 @@ fun SettingsScreen(
                 Triple(
                     SettingsManager.AUDIO_MODE_GLASSES_SDK,
                     "Glasses mic (SDK), test only",
-                    "Hears you when locked, but the glasses may mute Gemini's voice.",
+                    "Hears you when locked, but the glasses may mute Gemini's voice. Keeps the camera on.",
                 ),
             )
-            audioOptions.forEach { (value, title, description) ->
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .selectable(selected = audioMode == value, onClick = { audioMode = value }),
-                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-                ) {
-                    RadioButton(selected = audioMode == value, onClick = { audioMode = value })
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(title, style = MaterialTheme.typography.bodyLarge)
-                        Text(
-                            description,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-            }
+            ChoiceList(options = audioOptions, selected = audioMode, onSelect = { audioMode = it })
 
             // Notifications
             SectionHeader("Notifications")
@@ -302,6 +283,33 @@ fun SettingsScreen(
                 }
             },
         )
+    }
+}
+
+/** Radio list: (value, title, description) per option. */
+@Composable
+private fun ChoiceList(
+    options: List<Triple<String, String, String>>,
+    selected: String,
+    onSelect: (String) -> Unit,
+) {
+    options.forEach { (value, title, description) ->
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .selectable(selected = selected == value, onClick = { onSelect(value) }),
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        ) {
+            RadioButton(selected = selected == value, onClick = { onSelect(value) })
+            Column(modifier = Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
     }
 }
 

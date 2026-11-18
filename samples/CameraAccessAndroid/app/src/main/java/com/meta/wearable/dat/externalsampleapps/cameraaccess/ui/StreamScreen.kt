@@ -20,6 +20,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -30,6 +32,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -122,13 +125,24 @@ fun StreamScreen(
             )
         }
 
-        // Spinner until frames flow (session connecting, camera starting)
-        if (
+        // Spinner until frames flow (session connecting, camera starting) and while looking
+        val busy = streamUiState.isLooking ||
             streamUiState.streamSessionState == StreamState.STARTING ||
-                streamUiState.streamSessionState == StreamState.STARTED
-        ) {
+            streamUiState.streamSessionState == StreamState.STARTED
+        if (busy) {
             CircularProgressIndicator(
                 modifier = Modifier.align(Alignment.Center),
+            )
+        }
+
+        // On-demand camera: say why the screen is empty
+        if (streamUiState.cameraOnDemand && streamUiState.videoFrame == null && !busy) {
+            Text(
+                text = "Camera is off to save battery.\nAsk Gemini about what you see and it will take a photo.",
+                color = MaterialTheme.colorScheme.onBackground,
+                textAlign = TextAlign.Center,
+                style = MaterialTheme.typography.bodyLarge,
+                modifier = Modifier.align(Alignment.Center).padding(horizontal = 32.dp),
             )
         }
 

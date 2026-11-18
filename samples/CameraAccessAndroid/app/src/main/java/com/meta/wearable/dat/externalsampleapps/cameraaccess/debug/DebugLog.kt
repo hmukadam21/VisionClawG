@@ -48,6 +48,8 @@ object DebugLog {
   val audioMutedWhileGeminiSpeaks = AtomicLong()
   val geminiHeardSpeech = AtomicLong()
   val transcriptsIn = AtomicLong()
+  val looks = AtomicLong()
+  val looksFailed = AtomicLong()
   // Loudest sample seen since the last heartbeat (0 = pure silence, 32767 = max)
   val phoneMicPeak = AtomicInteger()
   val glassesMicPeak = AtomicInteger()
@@ -98,6 +100,7 @@ object DebugLog {
             "glassesAudio=${glassesAudioFrames.getAndSet(0)} mutedEcho=${audioMutedWhileGeminiSpeaks.getAndSet(0)} " +
             "geminiHeardSpeech=${geminiHeardSpeech.getAndSet(0)} transcripts=${transcriptsIn.getAndSet(0)} " +
             "peakPhoneMic=${phoneMicPeak.getAndSet(0)} peakGlassesMic=${glassesMicPeak.getAndSet(0)} " +
+            "looks=${looks.getAndSet(0)} looksFailed=${looksFailed.getAndSet(0)} " +
             "micSource=$micSource | $states",
     )
   }

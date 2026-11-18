@@ -25,4 +25,7 @@ data class StreamUiState(
     val isShareDialogVisible: Boolean = false,
     val isCapturing: Boolean = false,
     val streamingMode: StreamingMode = StreamingMode.GLASSES,
+    // v1.6 on-demand camera: camera off until Gemini looks; isLooking while a photo is taken
+    val cameraOnDemand: Boolean = false,
+    val isLooking: Boolean = false,
 )

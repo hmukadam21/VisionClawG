@@ -15,17 +15,29 @@ package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 // arrives within a few seconds, the app falls back to the phone microphone by itself.
 // Echo guard: while Gemini is speaking (plus a short tail) glasses-mic audio is not sent, so
 // Gemini does not hear its own voice from the glasses speakers. (No barge-in in this mode.)
+//
+// v1.6: look_through_glasses. In glasses mode Gemini gets a tool that asks the app for one sharp
+// photo (lookProvider, supplied by StreamViewModel). The photo is sent as the newest image, then
+// the tool answer tells Gemini to use it. With the on-demand camera this is the only way Gemini
+// sees; with live video it is the "closer look" for small text and details.
 
 import android.graphics.Bitmap
 import android.util.Log
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.debug.DebugLog
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.GeminiFunctionCall
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawBridge
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawConnectionState
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawEventClient
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.ToolCallRouter
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.ToolCallStatus
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.ToolResult
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.SettingsManager
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.stream.StreamingMode
 import kotlinx.coroutines.Job
@@ -46,6 +58,12 @@ data class GeminiUiState(
     val toolCallStatus: ToolCallStatus = ToolCallStatus.Idle,
     val openClawConnectionState: OpenClawConnectionState = OpenClawConnectionState.NotConfigured,
 )
+
+/** Result of one look through the glasses camera. */
+sealed class LookResult {
+    data class Photo(val bitmap: Bitmap) : LookResult()
+    data class Failed(val reason: String) : LookResult()
+}
 
 class GeminiSessionViewModel : ViewModel() {
     companion object {
@@ -86,6 +104,10 @@ class GeminiSessionViewModel : ViewModel() {
     // Set by StreamViewModel: true when the glasses stream was opened with microphone audio
     @Volatile var glassesAudioExpected: Boolean = false
 
+    // Set by StreamViewModel: takes one sharp photo through the glasses (look_through_glasses)
+    @Volatile var lookProvider: (suspend () -> LookResult)? = null
+    private val lookJobs = ConcurrentHashMap<String, Job>()
+
     private enum class MicSource { NONE, GLASSES, PHONE }
     @Volatile private var micSource = MicSource.NONE
     @Volatile private var lastGlassesAudioMs = 0L
@@ -110,6 +132,12 @@ class GeminiSessionViewModel : ViewModel() {
         reconnecting = false
         reconnectAttempts = 0
         geminiService.clearResumption() // a new tap on the AI button = a new conversation
+        // Glasses mode: the look tool; with the on-demand camera also the high-resolution request
+        val glasses = streamingMode == StreamingMode.GLASSES
+        val onDemand = glasses && SettingsManager.cameraOnDemand
+        geminiService.lookToolEnabled = glasses
+        geminiService.liveVideo = !onDemand
+        geminiService.requestHighMediaResolution = onDemand
         _uiState.value = _uiState.value.copy(isGeminiActive = true)
 
         // Wire audio callbacks
@@ -195,14 +223,70 @@ class GeminiSessionViewModel : ViewModel() {
     private fun wireToolCallbacks() {
         geminiService.onToolCall = { toolCall ->
             for (call in toolCall.functionCalls) {
-                toolCallRouter?.handleToolCall(call) { response ->
-                    geminiService.sendToolResponse(response)
+                if (call.name == GeminiConfig.LOOK_TOOL_NAME) {
+                    handleLook(call)
+                } else {
+                    toolCallRouter?.handleToolCall(call) { response ->
+                        geminiService.sendToolResponse(response)
+                    }
                 }
             }
         }
         geminiService.onToolCallCancellation = { cancellation ->
+            for (id in cancellation.ids) {
+                lookJobs.remove(id)?.let {
+                    it.cancel()
+                    DebugLog.log("LOOK", "look cancelled by Gemini (user spoke again)")
+                }
+            }
             toolCallRouter?.cancelToolCalls(cancellation.ids)
         }
+    }
+
+    /** look_through_glasses: take the photo, send it to Gemini, then answer the tool call. */
+    private fun handleLook(call: GeminiFunctionCall) {
+        DebugLog.log("LOOK", "Gemini asked to look")
+        val job = viewModelScope.launch {
+            val result = lookProvider?.invoke()
+                ?: LookResult.Failed("the glasses camera is not connected")
+            val toolResult = when (result) {
+                is LookResult.Photo -> {
+                    val sent = withContext(Dispatchers.Default) { geminiService.sendPhoto(result.bitmap) }
+                    if (sent != null) {
+                        DebugLog.log("LOOK", "photo sent to Gemini: $sent")
+                        ToolResult.Success(
+                            "Done. The photo just taken through the user's glasses is now your latest image. Answer from it."
+                        )
+                    } else {
+                        DebugLog.log("LOOK", "photo taken but Gemini was not connected")
+                        ToolResult.Failure("The connection dropped before the photo could be sent. Ask the user to repeat the question.")
+                    }
+                }
+                is LookResult.Failed -> {
+                    DebugLog.looksFailed.incrementAndGet()
+                    DebugLog.log("LOOK", "look FAILED: ${result.reason}")
+                    ToolResult.Failure(
+                        "The glasses camera could not take a photo (${result.reason}). Tell the user briefly and offer to try again."
+                    )
+                }
+            }
+            geminiService.sendToolResponse(
+                JSONObject().put(
+                    "toolResponse",
+                    JSONObject().put(
+                        "functionResponses",
+                        JSONArray().put(
+                            JSONObject()
+                                .put("id", call.id)
+                                .put("name", call.name)
+                                .put("response", toolResult.toJSON())
+                        ),
+                    ),
+                )
+            )
+            lookJobs.remove(call.id)
+        }
+        lookJobs[call.id] = job
     }
 
     /**
@@ -366,6 +450,8 @@ class GeminiSessionViewModel : ViewModel() {
         eventClient.disconnect()
         toolCallRouter?.cancelAll()
         toolCallRouter = null
+        lookJobs.values.forEach { it.cancel() }
+        lookJobs.clear()
         micWatchdogJob?.cancel()
         micWatchdogJob = null
         audioManager.stopAll()
@@ -381,7 +467,6 @@ class GeminiSessionViewModel : ViewModel() {
     }
 
     fun sendVideoFrameIfThrottled(bitmap: Bitmap) {
-        if (!SettingsManager.videoStreamingEnabled) return
         if (!_uiState.value.isGeminiActive) return
         if (_uiState.value.connectionState != GeminiConnectionState.Ready) return
         val now = System.currentTimeMillis()

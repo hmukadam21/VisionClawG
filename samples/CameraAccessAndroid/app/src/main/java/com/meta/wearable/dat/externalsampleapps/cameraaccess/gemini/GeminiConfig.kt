@@ -17,9 +17,31 @@ object GeminiConfig {
     const val VIDEO_FRAME_INTERVAL_MS = 1000L
     const val VIDEO_JPEG_QUALITY = 50
 
-    val systemInstruction: String
-        get() = if (isOpenClawConfigured) SettingsManager.geminiSystemPrompt
-        else SettingsManager.geminiSystemPrompt + NO_ACTIONS_NOTE
+    // One sharp photo for the look_through_glasses tool: long edge and JPEG quality sent to Gemini
+    const val PHOTO_MAX_EDGE = 1536
+    const val PHOTO_JPEG_QUALITY = 85
+
+    const val LOOK_TOOL_NAME = "look_through_glasses"
+
+    /**
+     * The user's prompt plus notes the app adds for this session.
+     * @param lookTool the look_through_glasses tool is declared (glasses mode)
+     * @param liveVideo the camera streams continuously (otherwise it is off until a look)
+     */
+    fun systemInstruction(lookTool: Boolean, liveVideo: Boolean): String {
+        var text = SettingsManager.geminiSystemPrompt
+        if (!isOpenClawConfigured) text += NO_ACTIONS_NOTE
+        if (lookTool) text += if (liveVideo) LOOK_NOTE_LIVE else LOOK_NOTE_ON_DEMAND
+        return text
+    }
+
+    private const val LOOK_NOTE_ON_DEMAND = """
+
+VISION, OVERRIDES THE ABOVE WHERE THEY DIFFER: the glasses camera is OFF to save battery. You see nothing until you call the look_through_glasses tool, which takes one fresh, sharp photo of what the user is looking at and gives it to you. Whenever answering needs sight (what is this, read this, how much is it, which one, describe, can you see, help me find, or anything about the user's surroundings), first say a very short phrase such as "Let me look", then call look_through_glasses. Never guess or describe things you have not seen in a photo. A photo shows only that moment: if the user asks about something new or has moved, call it again. Never claim you are watching live video."""
+
+    private const val LOOK_NOTE_LIVE = """
+
+VISION: you see a live but low-resolution video from the glasses. When you need fine detail (small text, prices, labels, screens, faraway signs), say a very short phrase such as "Let me take a closer look", then call the look_through_glasses tool, which gives you one sharp photo of the current view."""
 
     // Added while OpenClaw (the "actions" part) is not set up, so Gemini does not try to call,
     // message or search through a tool that cannot work, and says so plainly instead.

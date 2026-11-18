@@ -106,6 +106,14 @@ object ToolDeclarations {
         return JSONArray().put(executeJSON())
     }
 
+    /** VisionClaw's own tool: one sharp photo from the glasses camera (handled in the app). */
+    fun lookJSON(): JSONObject {
+        return JSONObject().apply {
+            put("name", com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini.GeminiConfig.LOOK_TOOL_NAME)
+            put("description", "Takes one sharp photo with the camera on the user's glasses, showing what they are looking at right now, and gives it to you as the latest image. Call it whenever answering needs sight. Takes a few seconds.")
+        }
+    }
+
     private fun executeJSON(): JSONObject {
         return JSONObject().apply {
             put("name", "execute")

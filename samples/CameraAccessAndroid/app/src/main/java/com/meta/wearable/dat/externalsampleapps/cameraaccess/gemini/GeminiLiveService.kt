@@ -9,6 +9,10 @@ package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 //   handle and the user does not notice.
 // - Stale-socket guard: events from an old WebSocket (closing after a reconnect) are ignored, so
 //   they cannot tear down the new connection.
+//
+// v1.6: the look_through_glasses tool (one sharp photo on demand, sent with sendPhoto) and a
+// request for high media resolution. If Gemini rejects the mediaResolution field during setup,
+// the app connects again without it, by itself, and remembers that for the rest of the run.
 
 import android.graphics.Bitmap
 import android.util.Base64
@@ -72,6 +76,15 @@ class GeminiLiveService {
     @Volatile private var connectCallback: ((Boolean) -> Unit)? = null
     private var timeoutTimer: Timer? = null
 
+    // Set by the view model before connect(): which tools and notes this session gets
+    @Volatile var lookToolEnabled = false
+    @Volatile var liveVideo = true
+    @Volatile var requestHighMediaResolution = false
+
+    // Gemini refused the mediaResolution field once: never send it again in this run
+    @Volatile private var mediaResolutionRejected = false
+    @Volatile private var mediaResolutionSent = false
+
     // Latest resumable session handle from the server (null = start a new conversation)
     @Volatile private var resumptionHandle: String? = null
 
@@ -102,7 +115,12 @@ class GeminiLiveService {
 
         _connectionState.value = GeminiConnectionState.Connecting
         connectCallback = callback
-        DebugLog.log("GEMINI", "connecting (model ${GeminiConfig.MODEL}, resume=${resumptionHandle != null})")
+        DebugLog.log(
+            "GEMINI",
+            "connecting (model ${GeminiConfig.MODEL}, resume=${resumptionHandle != null}, " +
+                "lookTool=$lookToolEnabled, liveVideo=$liveVideo, " +
+                "highMediaResolution=${requestHighMediaResolution && !mediaResolutionRejected})",
+        )
 
         val request = Request.Builder().url(url).build()
         val socket = client.newWebSocket(request, object : WebSocketListener() {
@@ -150,6 +168,18 @@ class GeminiLiveService {
                     "GEMINI",
                     "server closing connection: code $code, reason '$reason' while ${if (wasConnecting) "connecting" else "connected"}",
                 )
+                // Setup refused because of the mediaResolution field (named in the reason, or
+                // 1007 = invalid request; the reason text can be cut short): connect again without it
+                val pending = connectCallback
+                if (wasConnecting && pending != null && mediaResolutionSent &&
+                    (reason.contains("media", ignoreCase = true) || code == 1007)) {
+                    mediaResolutionRejected = true
+                    DebugLog.log("GEMINI", "high media resolution refused by Gemini: connecting again without it")
+                    connectCallback = null
+                    timeoutTimer?.cancel()
+                    connect(pending)
+                    return
+                }
                 // While connecting, keep Gemini's reason visible (e.g. a rejected setup field)
                 _connectionState.value =
                     if (wasConnecting) GeminiConnectionState.Error("Gemini closed the connection ($code): $reason")
@@ -243,6 +273,45 @@ class GeminiLiveService {
         }
     }
 
+    /**
+     * One sharp photo (look_through_glasses): scaled to PHOTO_MAX_EDGE, JPEG PHOTO_JPEG_QUALITY,
+     * sent as the newest video image. Returns a short size description for the log, or null if
+     * Gemini is not connected.
+     */
+    fun sendPhoto(photo: Bitmap): String? {
+        if (_connectionState.value != GeminiConnectionState.Ready) return null
+        val longEdge = maxOf(photo.width, photo.height)
+        val scaled = if (longEdge > GeminiConfig.PHOTO_MAX_EDGE) {
+            val factor = GeminiConfig.PHOTO_MAX_EDGE.toFloat() / longEdge
+            Bitmap.createScaledBitmap(
+                photo,
+                (photo.width * factor).toInt().coerceAtLeast(1),
+                (photo.height * factor).toInt().coerceAtLeast(1),
+                true,
+            )
+        } else {
+            photo
+        }
+        val baos = ByteArrayOutputStream()
+        scaled.compress(Bitmap.CompressFormat.JPEG, GeminiConfig.PHOTO_JPEG_QUALITY, baos)
+        val jpeg = baos.toByteArray()
+        val description = "${scaled.width}x${scaled.height} JPEG ${jpeg.size / 1024} KB"
+        if (scaled !== photo) scaled.recycle()
+        DebugLog.picturesSentToGemini.incrementAndGet()
+        sendExecutor.execute {
+            val json = JSONObject().apply {
+                put("realtimeInput", JSONObject().apply {
+                    put("video", JSONObject().apply {
+                        put("mimeType", "image/jpeg")
+                        put("data", Base64.encodeToString(jpeg, Base64.NO_WRAP))
+                    })
+                })
+            }
+            webSocket?.send(json.toString())
+        }
+        return description
+    }
+
     fun sendToolResponse(response: JSONObject) {
         sendExecutor.execute {
             webSocket?.send(response.toString())
@@ -283,16 +352,26 @@ class GeminiLiveService {
                 put("generationConfig", JSONObject().apply {
                     put("responseModalities", JSONArray().put("AUDIO"))
                     // gemini-3.8-live does not accept thinkingConfig; it must be omitted.
+                    // Sharper look at images (on-demand photos are few, so the cost is small)
+                    mediaResolutionSent = requestHighMediaResolution && !mediaResolutionRejected
+                    if (mediaResolutionSent) put("mediaResolution", "MEDIA_RESOLUTION_HIGH")
                 })
                 put("systemInstruction", JSONObject().apply {
                     put("parts", JSONArray().put(JSONObject().apply {
-                        put("text", GeminiConfig.systemInstruction)
+                        put("text", GeminiConfig.systemInstruction(lookToolEnabled, liveVideo))
                     }))
                 })
-                // The execute tool only when OpenClaw is set up; otherwise it can only fail
+                // look_through_glasses in glasses mode; execute only when OpenClaw is set up
+                // (otherwise it can only fail)
+                val declarations = JSONArray()
+                if (lookToolEnabled) declarations.put(ToolDeclarations.lookJSON())
                 if (GeminiConfig.isOpenClawConfigured) {
+                    val execute = ToolDeclarations.allDeclarationsJSON()
+                    for (i in 0 until execute.length()) declarations.put(execute.get(i))
+                }
+                if (declarations.length() > 0) {
                     put("tools", JSONArray().put(JSONObject().apply {
-                        put("functionDeclarations", ToolDeclarations.allDeclarationsJSON())
+                        put("functionDeclarations", declarations)
                     }))
                 }
                 put("realtimeInputConfig", JSONObject().apply {
