@@ -22,10 +22,10 @@
 //
 // On-demand camera (v1.6, the default): like Meta AI, the camera is OFF. The glasses session is
 // opened without a camera. When Gemini calls look_through_glasses (or the photo button is
-// tapped), lookNow() adds a camera and starts a 720x1280 stream. Since v1.7 the first settled
-// video picture is the answer (photos with stream.capturePhoto() took 4-9 s over Bluetooth and
-// often failed); a photo is taken only for fine detail and the photo button. The camera stays on
-// 20 s for follow-up questions, then switches itself off.
+// tapped), lookNow() adds a camera and starts a 720x1280 stream. Since v1.7 the first video
+// picture is the answer (photos with stream.capturePhoto() took 4-10 s over Bluetooth and failed
+// 5 of 6 times on 19 Nov); a photo is tried only for the photo button. The camera stays on 45 s
+// for follow-up questions, then switches itself off.
 // If the session ends meanwhile (glasses folded, link lost), the voice carries on and the next
 // look opens a new session. In live mode the same tool takes a sharp photo from the running
 // stream, falling back to the newest video picture.
@@ -120,10 +120,9 @@ class StreamViewModel(
     private const val CAMERA_STOP_TIMEOUT_MS = 3_000L
     private const val LOOK_FIRST_FRAME_TIMEOUT_MS = 8_000L
     private const val LOOK_FRESH_FRAME_TIMEOUT_MS = 3_000L
-    // After the first picture of a new camera, wait this long so the exposure has settled
-    private const val LOOK_SETTLE_MS = 500L
     // Camera stays on this long after a look, so follow-up questions are answered at once
-    private const val LOOK_LINGER_MS = 20_000L
+    // (v1.7.1: 45 s; with 20 s a follow-up 26 s later found the camera already off)
+    private const val LOOK_LINGER_MS = 45_000L
     // Look stream: 720x1280 at 7 fps (the first picture comes about 2 s after the camera starts)
     private const val LOOK_FRAME_RATE = 7
     private const val LOOK_JPEG_QUALITY = 90
@@ -619,10 +618,11 @@ class StreamViewModel(
         }
       }
 
-      // A video picture: a fresh one from a running camera, or the first settled one
+      // A video picture: a fresh one from a running camera, or the first one of a new camera
+      // (v1.7.1: no extra settle wait; the camera has been exposing for ~3 s by then)
       val picture =
           if (reuse || fineDetail) waitForLookFrame(askedAt, LOOK_FRESH_FRAME_TIMEOUT_MS)
-          else waitForSettledLookFrame()
+          else waitForLookFrame(0L, LOOK_FIRST_FRAME_TIMEOUT_MS)
       if (picture == null) {
         DebugLog.log("LOOK", "no video picture arrived (frames so far: $lookFramesSeen)")
         return LookResult.Failed("no picture arrived from the glasses")
@@ -647,14 +647,6 @@ class StreamViewModel(
         while (lastLookFrame == null || lastLookFrameAt <= newerThan) delay(40)
         lastLookFrame
       }
-
-  /** First picture of a new camera, then one LOOK_SETTLE_MS later (exposure settled). */
-  private suspend fun waitForSettledLookFrame(): Bitmap? {
-    val first = waitForLookFrame(0L, LOOK_FIRST_FRAME_TIMEOUT_MS) ?: return null
-    val firstAt = lastLookFrameAt
-    DebugLog.log("LOOK", "first picture ${first.width}x${first.height}, letting it settle")
-    return waitForLookFrame(firstAt + LOOK_SETTLE_MS - 1, LOOK_FRESH_FRAME_TIMEOUT_MS) ?: first
-  }
 
   /** Switches the look camera off after LOOK_LINGER_MS, unless another look comes first. */
   private fun scheduleLookSwitchOff() {

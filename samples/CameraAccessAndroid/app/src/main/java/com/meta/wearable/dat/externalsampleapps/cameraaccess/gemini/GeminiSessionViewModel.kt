@@ -17,7 +17,7 @@ package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 // Gemini does not hear its own voice from the glasses speakers. (No barge-in in this mode.)
 //
 // v1.6: look_through_glasses. In glasses mode Gemini gets a tool that asks the app for a picture
-// (lookProvider, supplied by StreamViewModel; fine_detail = a sharper but slower photo). Since
+// (lookProvider, supplied by StreamViewModel; fineDetail = the photo button's slower photo). Since
 // v1.7 the picture travels inside the tool answer (see GeminiLiveService.sendLookResult). With the on-demand camera this is the only way Gemini
 // sees; with live video it is the "closer look" for small text and details.
 
@@ -245,10 +245,10 @@ class GeminiSessionViewModel : ViewModel() {
 
     /** look_through_glasses: take the photo, send it to Gemini, then answer the tool call. */
     private fun handleLook(call: GeminiFunctionCall) {
-        val fineDetail = call.args["fine_detail"]?.toString()?.equals("true", ignoreCase = true) == true
-        DebugLog.log("LOOK", "Gemini asked to look${if (fineDetail) " (fine detail: sharp photo)" else ""}")
+        // v1.7.1: always the fast video picture (the Bluetooth photo failed 5 of 6 times on 19 Nov)
+        DebugLog.log("LOOK", "Gemini asked to look")
         val job = viewModelScope.launch {
-            val result = lookProvider?.invoke(fineDetail)
+            val result = lookProvider?.invoke(false)
                 ?: LookResult.Failed("the glasses camera is not connected")
             val toolResult = when (result) {
                 is LookResult.Photo -> {

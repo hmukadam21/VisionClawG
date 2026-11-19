@@ -44,11 +44,11 @@ object GeminiConfig {
 
     private const val LOOK_NOTE_ON_DEMAND = """
 
-VISION, OVERRIDES THE ABOVE WHERE THEY DIFFER: the glasses camera is OFF to save battery. You see nothing until you call the look_through_glasses tool, which returns a fresh picture of what the user is looking at. Whenever answering needs sight (what is this, read this, how much is it, which one, describe, can you see, help me find, or anything about the user's surroundings), first say a very short phrase such as "Let me look", then call look_through_glasses, and answer from the picture it returns. Set fine_detail to true only when you must read small text or see fine detail. Never guess or describe things you have not seen in a picture. A picture shows only that moment: if the user asks about something new or has moved, call it again. Never claim you are watching live video."""
+VISION, OVERRIDES THE ABOVE WHERE THEY DIFFER: the glasses camera is OFF to save battery. You see nothing until you call the look_through_glasses tool, which returns a fresh picture of what the user is looking at. Whenever answering needs sight (what is this, read this, how much is it, which one, describe, can you see, help me find, or anything about the user's surroundings), first say a very short phrase such as "Let me look", then call look_through_glasses, and answer from the picture it returns. Never guess or describe things you have not seen in a picture. A picture shows only that moment: if the user asks about something new or has moved, call it again. Never claim you are watching live video."""
 
     private const val LOOK_NOTE_LIVE = """
 
-VISION: you see a live but low-resolution video from the glasses. When you need fine detail (small text, prices, labels, screens, faraway signs), say a very short phrase such as "Let me take a closer look", then call the look_through_glasses tool with fine_detail true; it returns one sharp photo of the current view."""
+VISION: you see a live but low-resolution video from the glasses. When you need fine detail (small text, prices, labels, screens, faraway signs), say a very short phrase such as "Let me take a closer look", then call the look_through_glasses tool; it returns one sharp photo of the current view."""
 
     // Added while OpenClaw (the "actions" part) is not set up, so Gemini does not try to call,
     // message or search through a tool that cannot work, and says so plainly instead.
