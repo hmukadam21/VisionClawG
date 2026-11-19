@@ -13,14 +13,22 @@ package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 // v1.6: the look_through_glasses tool (one sharp photo on demand, sent with sendPhoto) and a
 // request for high media resolution. If Gemini rejects the mediaResolution field during setup,
 // the app connects again without it, by itself, and remembers that for the rest of the run.
+//
+// v1.7: the look's picture travels INSIDE the tool answer (a multimodal function response), so
+// Gemini answers the question it was asked. In v1.6 the picture went only as a video image,
+// which Gemini attaches to the user's NEXT turn, so it answered one question late. If Gemini
+// refuses a picture inside a tool answer, the app switches (and remembers) to: video image +
+// tool answer + a short text that starts a new turn with the picture in it.
 
 import android.graphics.Bitmap
+import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.debug.DebugLog
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.GeminiToolCall
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.GeminiToolCallCancellation
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.ToolDeclarations
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.SettingsManager
 import java.io.ByteArrayOutputStream
 import java.util.Timer
 import java.util.TimerTask
@@ -84,6 +92,11 @@ class GeminiLiveService {
     // Gemini refused the mediaResolution field once: never send it again in this run
     @Volatile private var mediaResolutionRejected = false
     @Volatile private var mediaResolutionSent = false
+
+    // Picture inside the tool answer: refused once = video + text from then on (kept in Settings
+    // when Gemini's reason says so clearly)
+    @Volatile private var multimodalToolResponseRejected = false
+    @Volatile private var lastMultimodalResponseAt = 0L
 
     // Latest resumable session handle from the server (null = start a new conversation)
     @Volatile private var resumptionHandle: String? = null
@@ -180,6 +193,22 @@ class GeminiLiveService {
                     connect(pending)
                     return
                 }
+                // Connection closed right after a picture inside a tool answer: Gemini refused it
+                val sinceMultimodal = SystemClock.elapsedRealtime() - lastMultimodalResponseAt
+                if (!wasConnecting && lastMultimodalResponseAt > 0 && sinceMultimodal < 15_000) {
+                    val clearReason = reason.contains("multimodal", ignoreCase = true) ||
+                        reason.contains("function", ignoreCase = true) ||
+                        reason.contains("parts", ignoreCase = true)
+                    if (clearReason || code == 1007) {
+                        multimodalToolResponseRejected = true
+                        if (clearReason) SettingsManager.multimodalToolResponseRejected = true
+                        DebugLog.log(
+                            "GEMINI",
+                            "picture inside the tool answer refused: next looks go as video + text",
+                        )
+                    }
+                }
+                lastMultimodalResponseAt = 0L
                 // While connecting, keep Gemini's reason visible (e.g. a rejected setup field)
                 _connectionState.value =
                     if (wasConnecting) GeminiConnectionState.Error("Gemini closed the connection ($code): $reason")
@@ -274,11 +303,11 @@ class GeminiLiveService {
     }
 
     /**
-     * One sharp photo (look_through_glasses): scaled to PHOTO_MAX_EDGE, JPEG PHOTO_JPEG_QUALITY,
-     * sent as the newest video image. Returns a short size description for the log, or null if
-     * Gemini is not connected.
+     * Answers a look_through_glasses call with its picture (scaled to PHOTO_MAX_EDGE, JPEG
+     * PHOTO_JPEG_QUALITY). The picture also goes as the newest video image. Returns a short
+     * description for the log, or null if Gemini is not connected.
      */
-    fun sendPhoto(photo: Bitmap): String? {
+    fun sendLookResult(callId: String, callName: String, photo: Bitmap): String? {
         if (_connectionState.value != GeminiConnectionState.Ready) return null
         val longEdge = maxOf(photo.width, photo.height)
         val scaled = if (longEdge > GeminiConfig.PHOTO_MAX_EDGE) {
@@ -295,19 +324,50 @@ class GeminiLiveService {
         val baos = ByteArrayOutputStream()
         scaled.compress(Bitmap.CompressFormat.JPEG, GeminiConfig.PHOTO_JPEG_QUALITY, baos)
         val jpeg = baos.toByteArray()
-        val description = "${scaled.width}x${scaled.height} JPEG ${jpeg.size / 1024} KB"
         if (scaled !== photo) scaled.recycle()
         DebugLog.picturesSentToGemini.incrementAndGet()
+        val data = Base64.encodeToString(jpeg, Base64.NO_WRAP)
+        val inside = !multimodalToolResponseRejected && !SettingsManager.multimodalToolResponseRejected
+        val description = "${scaled.width}x${scaled.height} JPEG ${jpeg.size / 1024} KB, " +
+            if (inside) "inside the tool answer" else "as video image + text"
         sendExecutor.execute {
-            val json = JSONObject().apply {
+            // 1. The newest video image (with the old way, the picture reaches Gemini only so)
+            webSocket?.send(JSONObject().apply {
                 put("realtimeInput", JSONObject().apply {
                     put("video", JSONObject().apply {
                         put("mimeType", "image/jpeg")
-                        put("data", Base64.encodeToString(jpeg, Base64.NO_WRAP))
+                        put("data", data)
                     })
                 })
+            }.toString())
+            // 2. The tool answer, with the picture inside it when Gemini accepts that
+            val functionResponse = JSONObject().apply {
+                put("id", callId)
+                put("name", callName)
+                if (inside) {
+                    put("response", JSONObject().put("result", GeminiConfig.LOOK_RESULT_ATTACHED))
+                    put("parts", JSONArray().put(JSONObject().apply {
+                        put("inlineData", JSONObject().apply {
+                            put("mimeType", "image/jpeg")
+                            put("data", data)
+                        })
+                    }))
+                } else {
+                    put("response", JSONObject().put("result", GeminiConfig.LOOK_RESULT_FOLLOWS))
+                }
             }
-            webSocket?.send(json.toString())
+            if (inside) lastMultimodalResponseAt = SystemClock.elapsedRealtime()
+            webSocket?.send(JSONObject().apply {
+                put("toolResponse", JSONObject().apply {
+                    put("functionResponses", JSONArray().put(functionResponse))
+                })
+            }.toString())
+            // 3. Old way only: a short text starts a new turn that carries the picture
+            if (!inside) {
+                webSocket?.send(JSONObject().apply {
+                    put("realtimeInput", JSONObject().put("text", GeminiConfig.LOOK_NUDGE))
+                }.toString())
+            }
         }
         return description
     }

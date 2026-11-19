@@ -22,8 +22,10 @@
 //
 // On-demand camera (v1.6, the default): like Meta AI, the camera is OFF. The glasses session is
 // opened without a camera. When Gemini calls look_through_glasses (or the photo button is
-// tapped), lookNow() adds a camera, starts a small stream (the SDK's photo rides a running
-// stream), takes ONE photo with stream.capturePhoto(), and switches the camera off again.
+// tapped), lookNow() adds a camera and starts a 720x1280 stream. Since v1.7 the first settled
+// video picture is the answer (photos with stream.capturePhoto() took 4-9 s over Bluetooth and
+// often failed); a photo is taken only for fine detail and the photo button. The camera stays on
+// 20 s for follow-up questions, then switches itself off.
 // If the session ends meanwhile (glasses folded, link lost), the voice carries on and the next
 // look opens a new session. In live mode the same tool takes a sharp photo from the running
 // stream, falling back to the newest video picture.
@@ -80,6 +82,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -110,12 +113,20 @@ class StreamViewModel(
     // preview; Gemini takes one per second of those (throttled in GeminiSessionViewModel).
     private const val PICTURE_INTERVAL_MS = 250L
 
-    // On-demand look: waits (the photo itself took about 1 s in Meta's own sample app)
+    // On-demand look: waits
     private const val SESSION_START_TIMEOUT_MS = 10_000L
     private const val CAMERA_START_TIMEOUT_MS = 10_000L
     private const val PHOTO_TIMEOUT_MS = 15_000L
     private const val CAMERA_STOP_TIMEOUT_MS = 3_000L
-    private const val FRAME_FALLBACK_WAIT_MS = 1_500L
+    private const val LOOK_FIRST_FRAME_TIMEOUT_MS = 8_000L
+    private const val LOOK_FRESH_FRAME_TIMEOUT_MS = 3_000L
+    // After the first picture of a new camera, wait this long so the exposure has settled
+    private const val LOOK_SETTLE_MS = 500L
+    // Camera stays on this long after a look, so follow-up questions are answered at once
+    private const val LOOK_LINGER_MS = 20_000L
+    // Look stream: 720x1280 at 7 fps (the first picture comes about 2 s after the camera starts)
+    private const val LOOK_FRAME_RATE = 7
+    private const val LOOK_JPEG_QUALITY = 90
 
     // Photos are decoded at no more than about this size (a full photo would be ~48 MB in memory)
     private const val KEEP_MAX_EDGE = 2048
@@ -158,15 +169,19 @@ class StreamViewModel(
   @Volatile private var lookCameraStream: Stream? = null
   @Volatile private var lookDecoder: GlassesFrameDecoder? = null
   @Volatile private var lastLookFrame: Bitmap? = null
+  @Volatile private var lastLookFrameAt = 0L
+  @Volatile private var lookFramesSeen = 0
+  @Volatile private var lookStreamState: StreamState? = null
   private val lookCameraJobs = mutableListOf<Job>()
-  @Volatile private var lookTeardownJob: Job? = null
+  // Waits LOOK_LINGER_MS, then switches the look camera off
+  @Volatile private var lookLingerJob: Job? = null
 
   // VisionClaw additions
   var geminiViewModel: GeminiSessionViewModel? = null
     set(value) {
       field = value
       // Gemini's look_through_glasses tool takes its photo here
-      value?.lookProvider = { lookNow() }
+      value?.lookProvider = { fineDetail -> lookNow(fineDetail) }
     }
   var webrtcViewModel: WebRTCSessionViewModel? = null
   private var phoneCameraManager: PhoneCameraManager? = null
@@ -442,8 +457,8 @@ class StreamViewModel(
     frameDecoder = null
 
     // On-demand look camera, if one is on right now
-    lookTeardownJob?.cancel()
-    lookTeardownJob = null
+    lookLingerJob?.cancel()
+    lookLingerJob = null
     releaseLookCamera()
 
     // Closing the camera stops its stream; stopping the session releases the glasses.
@@ -470,7 +485,7 @@ class StreamViewModel(
       _uiState.update { it.copy(isCapturing = true) }
       viewModelScope.launch {
         DebugLog.log("LOOK", "photo button tapped")
-        when (val result = lookNow()) {
+        when (val result = lookNow(fineDetail = true)) {
           is LookResult.Photo ->
               _uiState.update {
                 it.copy(
@@ -527,19 +542,20 @@ class StreamViewModel(
 
   // MARK: - Look (one sharp photo for Gemini: look_through_glasses)
 
-  /** Takes one sharp photo through the glasses. Never throws; failures come back as Failed. */
-  suspend fun lookNow(): LookResult =
+  /**
+   * A picture through the glasses for Gemini. fineDetail = a sharper photo (slower). Never
+   * throws; failures come back as Failed.
+   */
+  suspend fun lookNow(fineDetail: Boolean = false): LookResult =
       lookMutex.withLock {
         DebugLog.looks.incrementAndGet()
-        // The previous look's camera must be fully off before a new one is added
-        lookTeardownJob?.join()
         try {
           when {
             _uiState.value.streamingMode == StreamingMode.PHONE ->
                 _uiState.value.videoFrame?.let { LookResult.Photo(it) }
                     ?: LookResult.Failed("no picture from the phone camera yet")
             !onDemand -> liveLook()
-            else -> onDemandLook()
+            else -> onDemandLook(fineDetail)
           }
         } catch (e: CancellationException) {
           throw e
@@ -560,47 +576,94 @@ class StreamViewModel(
     return LookResult.Photo(frame)
   }
 
-  /** On-demand mode: camera on, one photo, camera off (switched off in the background). */
-  private suspend fun onDemandLook(): LookResult {
-    val startedAt = SystemClock.elapsedRealtime()
+  /**
+   * On-demand mode (v1.7): camera on at 720x1280, the first settled video picture is the answer
+   * (photos over the Bluetooth link took 4-9 s and often failed). The camera stays on for
+   * LOOK_LINGER_MS afterwards, so a follow-up question gets a picture at once. fineDetail asks
+   * for a photo first (1440x1080, slower), with a video picture if the photo does not come.
+   */
+  private suspend fun onDemandLook(fineDetail: Boolean): LookResult {
+    val askedAt = SystemClock.elapsedRealtime()
     _uiState.update { it.copy(isLooking = true) }
     try {
-      val currentSession =
-          ensureSessionStarted() ?: return LookResult.Failed("the glasses are not connected")
-      val sessionMs = SystemClock.elapsedRealtime() - startedAt
+      // A camera still on from the last look is reused; one being switched off is waited for
+      lookLingerJob?.let {
+        it.cancel()
+        it.join()
+      }
+      lookLingerJob = null
+      val reuse = lookCamera != null && lookStreamState == StreamState.STREAMING
+      val lookStream: Stream
+      if (reuse) {
+        lookStream = lookCameraStream ?: return LookResult.Failed("the glasses camera was lost")
+        DebugLog.log("LOOK", "camera still on from the last look")
+      } else {
+        if (lookCamera != null) releaseLookCamera() // leftovers of a camera that never streamed
+        val currentSession =
+            ensureSessionStarted() ?: return LookResult.Failed("the glasses are not connected")
+        val sessionMs = SystemClock.elapsedRealtime() - askedAt
+        lookStream = startLookCamera(currentSession)
+            ?: return LookResult.Failed("the glasses camera could not be switched on")
+        DebugLog.log(
+            "LOOK",
+            "camera on after ${SystemClock.elapsedRealtime() - askedAt} ms (glasses ready after $sessionMs ms)",
+        )
+      }
 
-      val lookStream = startLookCamera(currentSession)
-          ?: return LookResult.Failed("the glasses camera could not be switched on")
+      if (fineDetail) {
+        val photo = takeStreamPhoto(lookStream)
+        if (photo != null) {
+          _uiState.update { it.copy(videoFrame = photo) }
+          DebugLog.log("LOOK", "look done in ${SystemClock.elapsedRealtime() - askedAt} ms (photo)")
+          return LookResult.Photo(photo)
+        }
+      }
+
+      // A video picture: a fresh one from a running camera, or the first settled one
+      val picture =
+          if (reuse || fineDetail) waitForLookFrame(askedAt, LOOK_FRESH_FRAME_TIMEOUT_MS)
+          else waitForSettledLookFrame()
+      if (picture == null) {
+        DebugLog.log("LOOK", "no video picture arrived (frames so far: $lookFramesSeen)")
+        return LookResult.Failed("no picture arrived from the glasses")
+      }
+      _uiState.update { it.copy(videoFrame = picture) }
       DebugLog.log(
           "LOOK",
-          "camera on after ${SystemClock.elapsedRealtime() - startedAt} ms (glasses ready after $sessionMs ms)",
+          "look done in ${SystemClock.elapsedRealtime() - askedAt} ms " +
+              "(video picture ${picture.width}x${picture.height})",
       )
-
-      val photo = takeStreamPhoto(lookStream)
-      if (photo != null) {
-        _uiState.update { it.copy(videoFrame = photo) }
-        DebugLog.log("LOOK", "look done in ${SystemClock.elapsedRealtime() - startedAt} ms")
-        return LookResult.Photo(photo)
-      }
-
-      // No photo: the small video picture is better than nothing
-      val frame =
-          lastLookFrame
-              ?: withTimeoutOrNull(FRAME_FALLBACK_WAIT_MS) {
-                while (lastLookFrame == null) delay(100)
-                lastLookFrame
-              }
-      return if (frame != null) {
-        DebugLog.log("LOOK", "using a video picture instead (${frame.width}x${frame.height})")
-        LookResult.Photo(frame)
-      } else {
-        LookResult.Failed("the photo did not arrive from the glasses")
-      }
+      return LookResult.Photo(picture)
     } finally {
       _uiState.update { it.copy(isLooking = false) }
-      // Camera off in the background so Gemini gets the photo without waiting for it
-      if (lookCamera != null) lookTeardownJob = viewModelScope.launch { switchOffLookCamera() }
+      // Camera stays on a little for follow-up questions, then switches off by itself
+      if (lookCamera != null) scheduleLookSwitchOff()
     }
+  }
+
+  /** Waits for a decoded picture newer than [newerThan] (elapsedRealtime), or null. */
+  private suspend fun waitForLookFrame(newerThan: Long, timeoutMs: Long): Bitmap? =
+      withTimeoutOrNull(timeoutMs) {
+        while (lastLookFrame == null || lastLookFrameAt <= newerThan) delay(40)
+        lastLookFrame
+      }
+
+  /** First picture of a new camera, then one LOOK_SETTLE_MS later (exposure settled). */
+  private suspend fun waitForSettledLookFrame(): Bitmap? {
+    val first = waitForLookFrame(0L, LOOK_FIRST_FRAME_TIMEOUT_MS) ?: return null
+    val firstAt = lastLookFrameAt
+    DebugLog.log("LOOK", "first picture ${first.width}x${first.height}, letting it settle")
+    return waitForLookFrame(firstAt + LOOK_SETTLE_MS - 1, LOOK_FRESH_FRAME_TIMEOUT_MS) ?: first
+  }
+
+  /** Switches the look camera off after LOOK_LINGER_MS, unless another look comes first. */
+  private fun scheduleLookSwitchOff() {
+    lookLingerJob?.cancel()
+    lookLingerJob =
+        viewModelScope.launch {
+          delay(LOOK_LINGER_MS)
+          withContext(NonCancellable) { switchOffLookCamera() }
+        }
   }
 
   /** The glasses session, (re)opened if needed and STARTED, or null. */
@@ -628,9 +691,13 @@ class StreamViewModel(
   private suspend fun startLookCamera(currentSession: DeviceSession): Stream? {
     var added: Camera? = null
     var addError: String? = null
-    // Small stream: the photo rides it, and a small stream leaves the link to the photo
+    // 720x1280: since v1.7 a video picture is the usual answer (the photo is the slow extra)
     val config =
-        StreamConfiguration(videoQuality = VideoQuality.LOW, frameRate = FRAME_RATE, compressVideo = true)
+        StreamConfiguration(
+            videoQuality = VideoQuality.HIGH,
+            frameRate = LOOK_FRAME_RATE,
+            compressVideo = true,
+        )
     currentSession.addCamera(config).onSuccess { added = it }.onFailure { e, _ -> addError = e.description }
     if (added == null) {
       // The previous camera may still be detaching: one more try a moment later
@@ -649,8 +716,12 @@ class StreamViewModel(
     lookCameraStream = lookStream
 
     lastLookFrame = null
-    val decoder = GlassesFrameDecoder(PICTURE_INTERVAL_MS) { bitmap ->
+    lastLookFrameAt = 0L
+    lookFramesSeen = 0
+    lookStreamState = null
+    val decoder = GlassesFrameDecoder(PICTURE_INTERVAL_MS, LOOK_JPEG_QUALITY) { bitmap ->
       lastLookFrame = bitmap
+      lastLookFrameAt = SystemClock.elapsedRealtime()
       _uiState.update { it.copy(videoFrame = bitmap) }
     }
     lookDecoder = decoder
@@ -659,6 +730,7 @@ class StreamViewModel(
           viewModelScope.launch(frameDispatcher) {
             lookStream.videoStream.collect { frame ->
               DebugLog.glassesFrames.incrementAndGet()
+              lookFramesSeen++
               if (frame.isCompressed) decoder.decode(frame)
             }
           }
@@ -666,6 +738,7 @@ class StreamViewModel(
           viewModelScope.launch {
             lookStream.state.collect { state ->
               DebugLog.log("LOOK", "camera state: $state")
+              lookStreamState = state
               _uiState.update { it.copy(streamSessionState = state) }
             }
           }
@@ -777,6 +850,7 @@ class StreamViewModel(
     val cam = lookCamera
     lookCamera = null
     lookCameraStream = null
+    lookStreamState = null
     synchronized(lookCameraJobs) {
       lookCameraJobs.forEach { it.cancel() }
       lookCameraJobs.clear()

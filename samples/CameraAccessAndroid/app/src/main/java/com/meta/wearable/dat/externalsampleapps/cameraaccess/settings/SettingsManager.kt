@@ -77,6 +77,11 @@ object SettingsManager {
         get() = prefs.getString("cameraMode", null) ?: CAMERA_ON_DEMAND
         set(value) = prefs.edit().putString("cameraMode", value).apply()
 
+    // Gemini refused a photo inside a tool answer once (v1.7): send looks as video + text instead
+    var multimodalToolResponseRejected: Boolean
+        get() = prefs.getBoolean("multimodalToolResponseRejected", false)
+        set(value) = prefs.edit().putBoolean("multimodalToolResponseRejected", value).apply()
+
     /** On-demand camera, except in the SDK-mic test mode, whose audio rides the live stream. */
     val cameraOnDemand: Boolean
         get() = cameraMode != CAMERA_LIVE && audioMode != AUDIO_MODE_GLASSES_SDK

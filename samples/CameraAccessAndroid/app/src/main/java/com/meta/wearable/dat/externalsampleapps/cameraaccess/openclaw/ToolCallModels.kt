@@ -110,7 +110,16 @@ object ToolDeclarations {
     fun lookJSON(): JSONObject {
         return JSONObject().apply {
             put("name", com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini.GeminiConfig.LOOK_TOOL_NAME)
-            put("description", "Takes one sharp photo with the camera on the user's glasses, showing what they are looking at right now, and gives it to you as the latest image. Call it whenever answering needs sight. Takes a few seconds.")
+            put("description", "Shows you what the user is looking at right now, through the camera on their glasses. The picture comes back with this tool's answer. Call it whenever answering needs sight.")
+            put("parameters", JSONObject().apply {
+                put("type", "object")
+                put("properties", JSONObject().apply {
+                    put("fine_detail", JSONObject().apply {
+                        put("type", "boolean")
+                        put("description", "true only to read small text or see fine detail: a sharper photo that takes several seconds longer. Leave false for everything else (fast).")
+                    })
+                })
+            })
         }
     }
 

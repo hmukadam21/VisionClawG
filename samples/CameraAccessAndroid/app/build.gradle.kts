@@ -40,8 +40,12 @@ android {
     minSdk = 31
     // Kept at 34 so Android behaviour of the app does not change in this upgrade.
     targetSdk = 34
-    versionCode = 9
-    versionName = "1.6.1-look"
+    versionCode = 10
+    versionName = "1.7-look"
+
+    // Only the phone's processor type (64-bit ARM, e.g. Xiaomi 14T Pro): the app file shrinks
+    // a lot, so updating over the old version is quicker.
+    ndk { abiFilters += listOf("arm64-v8a") }
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     vectorDrawables { useSupportLibrary = true }

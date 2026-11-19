@@ -37,6 +37,8 @@ import java.io.ByteArrayOutputStream
 
 class GlassesFrameDecoder(
     private val minIntervalMs: Long,
+    // JPEG step quality: 70 for the live preview, higher for a look sent to Gemini
+    private val jpegQuality: Int = JPEG_QUALITY,
     private val onBitmap: (Bitmap) -> Unit,
 ) {
   companion object {
@@ -203,7 +205,7 @@ class GlassesFrameDecoder(
     val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
     val jpeg =
         ByteArrayOutputStream().use { stream ->
-          yuvImage.compressToJpeg(Rect(0, 0, width, height), JPEG_QUALITY, stream)
+          yuvImage.compressToJpeg(Rect(0, 0, width, height), jpegQuality, stream)
           stream.toByteArray()
         }
     return BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)

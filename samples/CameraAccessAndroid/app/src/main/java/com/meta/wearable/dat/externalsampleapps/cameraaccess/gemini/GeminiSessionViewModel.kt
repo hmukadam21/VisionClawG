@@ -16,9 +16,9 @@ package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 // Echo guard: while Gemini is speaking (plus a short tail) glasses-mic audio is not sent, so
 // Gemini does not hear its own voice from the glasses speakers. (No barge-in in this mode.)
 //
-// v1.6: look_through_glasses. In glasses mode Gemini gets a tool that asks the app for one sharp
-// photo (lookProvider, supplied by StreamViewModel). The photo is sent as the newest image, then
-// the tool answer tells Gemini to use it. With the on-demand camera this is the only way Gemini
+// v1.6: look_through_glasses. In glasses mode Gemini gets a tool that asks the app for a picture
+// (lookProvider, supplied by StreamViewModel; fine_detail = a sharper but slower photo). Since
+// v1.7 the picture travels inside the tool answer (see GeminiLiveService.sendLookResult). With the on-demand camera this is the only way Gemini
 // sees; with live video it is the "closer look" for small text and details.
 
 import android.graphics.Bitmap
@@ -105,7 +105,7 @@ class GeminiSessionViewModel : ViewModel() {
     @Volatile var glassesAudioExpected: Boolean = false
 
     // Set by StreamViewModel: takes one sharp photo through the glasses (look_through_glasses)
-    @Volatile var lookProvider: (suspend () -> LookResult)? = null
+    @Volatile var lookProvider: (suspend (fineDetail: Boolean) -> LookResult)? = null
     private val lookJobs = ConcurrentHashMap<String, Job>()
 
     private enum class MicSource { NONE, GLASSES, PHONE }
@@ -245,28 +245,29 @@ class GeminiSessionViewModel : ViewModel() {
 
     /** look_through_glasses: take the photo, send it to Gemini, then answer the tool call. */
     private fun handleLook(call: GeminiFunctionCall) {
-        DebugLog.log("LOOK", "Gemini asked to look")
+        val fineDetail = call.args["fine_detail"]?.toString()?.equals("true", ignoreCase = true) == true
+        DebugLog.log("LOOK", "Gemini asked to look${if (fineDetail) " (fine detail: sharp photo)" else ""}")
         val job = viewModelScope.launch {
-            val result = lookProvider?.invoke()
+            val result = lookProvider?.invoke(fineDetail)
                 ?: LookResult.Failed("the glasses camera is not connected")
             val toolResult = when (result) {
                 is LookResult.Photo -> {
                     val sent = try {
-                        withContext(Dispatchers.Default) { geminiService.sendPhoto(result.bitmap) }
+                        withContext(Dispatchers.Default) {
+                            geminiService.sendLookResult(call.id, call.name, result.bitmap)
+                        }
                     } catch (e: kotlinx.coroutines.CancellationException) {
                         throw e
                     } catch (e: Exception) {
-                        DebugLog.log("LOOK", "could not prepare the photo: ${e.javaClass.simpleName}: ${e.message}")
+                        DebugLog.log("LOOK", "could not prepare the picture: ${e.javaClass.simpleName}: ${e.message}")
                         null
                     }
                     if (sent != null) {
-                        DebugLog.log("LOOK", "photo sent to Gemini: $sent")
-                        ToolResult.Success(
-                            "Done. The photo just taken through the user's glasses is now your latest image. Answer from it."
-                        )
+                        DebugLog.log("LOOK", "picture sent to Gemini: $sent")
+                        null // answered together with the picture
                     } else {
-                        DebugLog.log("LOOK", "photo taken but Gemini was not connected")
-                        ToolResult.Failure("The connection dropped before the photo could be sent. Ask the user to repeat the question.")
+                        DebugLog.log("LOOK", "picture taken but Gemini was not connected")
+                        ToolResult.Failure("The connection dropped before the picture could be sent. Ask the user to repeat the question.")
                     }
                 }
                 is LookResult.Failed -> {
@@ -277,20 +278,23 @@ class GeminiSessionViewModel : ViewModel() {
                     )
                 }
             }
-            geminiService.sendToolResponse(
-                JSONObject().put(
-                    "toolResponse",
+            // A picture was already answered with sendLookResult; failures are answered here
+            if (toolResult != null) {
+                geminiService.sendToolResponse(
                     JSONObject().put(
-                        "functionResponses",
-                        JSONArray().put(
-                            JSONObject()
-                                .put("id", call.id)
-                                .put("name", call.name)
-                                .put("response", toolResult.toJSON())
+                        "toolResponse",
+                        JSONObject().put(
+                            "functionResponses",
+                            JSONArray().put(
+                                JSONObject()
+                                    .put("id", call.id)
+                                    .put("name", call.name)
+                                    .put("response", toolResult.toJSON())
+                            ),
                         ),
-                    ),
+                    )
                 )
-            )
+            }
             lookJobs.remove(call.id)
         }
         lookJobs[call.id] = job
