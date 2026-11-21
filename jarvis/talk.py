@@ -15,7 +15,7 @@ DEFAULT_VOICE = "en-US-EmmaMultilingualNeural"
 SPOKEN = {  # texting shorthand -> words to say
     "m": "i'm", "im": "i'm", "gud": "good", "gr8": "great", "u": "you", "ur": "your", "r": "are", "wen": "when", "txt": "text",
     "fr": "for real", "lol": "haha", "lmao": "haha", "cos": "because", "coz": "because",
-    "nyt": "night", "ryt": "right", "lngg": "long", "pls": "please", "plz": "please",
+    "nyt": "night", "ryt": "right", "lngg": "lang", "lng": "lang", "pls": "please", "plz": "please",
     "thx": "thanks", "ty": "thank you", "gd": "good", "gn": "good night", "gm": "good morning",
     "b4": "before", "2day": "today", "2nyt": "tonight", "tmrw": "tomorrow", "idk": "i don't know",
     "omg": "oh my god", "btw": "by the way", "k": "okay", "kk": "okay", "ok": "okay",
