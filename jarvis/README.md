@@ -10,3 +10,8 @@ Files for the Jarvis assistant in `~/Jarvis2.0` on the phone. Start it with the 
   (private); `jarvis --check` tests the brain and every source. Python standard library only.
 - `Modelfile`: the local model's personality, with the Llama 3 chat template (without it
   Ollama drops the personality text).
+- `talk.py`: spoken conversation with a local model: `talk jane` or `talk jarvis`. You speak
+  (Android speech recognition via Termux:API, if installed) or type (`--type`); the reply is
+  shown and spoken in the voice from `voice.txt` (Emma by default) with edge-tts + mpv, through
+  the phone's sound output (the glasses when connected). Jane's texting shorthand is spoken
+  as full words and emojis are not spoken.
