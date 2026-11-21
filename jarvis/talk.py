@@ -19,7 +19,7 @@ SPOKEN = {  # texting shorthand -> words to say
     "thx": "thanks", "ty": "thank you", "gd": "good", "gn": "good night", "gm": "good morning",
     "b4": "before", "2day": "today", "2nyt": "tonight", "tmrw": "tomorrow", "idk": "i don't know",
     "omg": "oh my god", "btw": "by the way", "k": "okay", "kk": "okay", "ok": "okay",
-    "luv": "love", "wat": "what", "wt": "what", "y": "why", "n": "and", "msg": "message",
+    "luv": "love", "wat": "what", "wut": "what", "wt": "what", "y": "why", "n": "and", "msg": "message",
     "bcz": "because", "abt": "about", "hw": "how", "nw": "now", "dnt": "don't", "cnt": "can't",
 }
 EMOJI = re.compile("[\U0001F000-\U0001FAFF☀-➿←-⇿⬀-⯿️‍]")
@@ -58,17 +58,36 @@ def speak(text, voice):
         print("  (voice failed: " + type(e).__name__ + ")")
 
 
+def hear_once():
+    """One round of Android speech recognition: (text, problem)."""
+    heard = subprocess.run(["termux-speech-to-text"], capture_output=True, text=True)
+    out = heard.stdout.strip()
+    if out.startswith("{"):  # Termux:API reports problems as JSON (e.g. microphone not allowed)
+        try:
+            return "", str(json.loads(out).get("error", out))[:100]
+        except ValueError:
+            return "", out[:100]
+    # keep real words only (drop stray brackets and empty partial lines); the last line is final
+    lines = [l.strip() for l in out.splitlines() if re.search(r"\w", l)]
+    return (lines[-1] if lines else ""), ""
+
+
 def listen(can_hear):
     """What the user said (speech recognition) or typed. None means finish."""
     if can_hear:
-        print("  (listening... speak now)")
-        heard = subprocess.run(["termux-speech-to-text"], capture_output=True, text=True)
-        lines = [l.strip() for l in heard.stdout.splitlines() if l.strip()]
-        if lines:
-            print("you: " + lines[-1])
-            return lines[-1]
-        typed = input("  (did not catch that; type it, or press Enter to try again) you: ").strip()
-        return typed if typed else ""
+        for attempt in range(3):  # hands-free: try again by itself when nothing was caught
+            print("  (listening... speak now)")
+            text, problem = hear_once()
+            if text:
+                print("you: " + text)
+                return text
+            if problem:
+                print("  (speech recognition: " + problem + ")")
+                break
+        try:
+            return input("  (did not catch that; type it, or press Enter to listen again) you: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
     try:
         return input("you: ").strip()
     except (EOFError, KeyboardInterrupt):
