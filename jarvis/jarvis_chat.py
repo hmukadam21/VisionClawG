@@ -8,6 +8,10 @@
 # are refused, other Gemini models on the key are tried and the first that works is
 # remembered (gemini_model.txt); a failed lookup gets an honest fixed answer instead of
 # Jarvis guessing (it had wrongly called xcite.com inactive).
+# v4 (21 Nov): Google search lookups are not in the free tier of the Gemini 3 models, so every
+# flash model on the key is tried (older ones first) until one is allowed; models refused for
+# quota are skipped for the rest of the session, and if all are refused the lookups pause
+# for the session with one clear message. --check now tests every flash model with search.
 import datetime, json, os, re, sys, urllib.error, urllib.request
 
 HOME = os.path.expanduser("~/Jarvis2.0")
@@ -97,9 +101,16 @@ def other_models(key):
         if "gemini" not in name or any(w in name for w in SKIP_WORDS):
             continue
         names.append(name)
-    # Flash before others, full before lite, stable before preview; newest version first in each
-    names = sorted(set(names), reverse=True)
-    return sorted(names, key=lambda n: ("flash" not in n, "lite" in n, "preview" in n or "exp" in n))
+    # Flash only; older numbered versions first (Google's free search allowance has been on
+    # older models), full before lite, stable before preview; aliases and omni last
+    names = sorted(set(n for n in names if "flash" in n))
+    def rank(n):
+        version = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+        return ("omni" in n or "latest" in n or version is None,
+                "preview" in n or "exp" in n,
+                float(version.group(1)) if version else 99.0,
+                "lite" in n)
+    return sorted(names, key=rank)
 
 
 def remembered_model():
@@ -109,8 +120,14 @@ def remembered_model():
         return None
 
 
+REFUSED = set()          # models Google refused for quota in this session
+SEARCH_OFF = []          # set when every model was refused: no more lookups this session
+
+
 def live_facts(question, key):
     """Short current facts from Gemini + Google Search: (facts, model) or (None, reasons)."""
+    if SEARCH_OFF:
+        return None, ["Google refused web lookups for every model on this key earlier in this chat"]
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     prompt = ("It is now " + now + " (Kuwait). Search Google and give only the current facts needed "
               "to answer the question below, in at most 3 short sentences, with numbers, units and "
@@ -121,18 +138,20 @@ def live_facts(question, key):
     tried, reasons = [], []
     for model in first + ["*"]:
         if model == "*":
-            # The usual models were refused: try the other models this key offers (at most 4)
-            extra = [m for m in other_models(key) if m not in tried][:4]
+            # The usual models were refused: try the other flash models this key offers
+            extra = [m for m in other_models(key) if m not in tried and m not in REFUSED][:10]
             if extra:
-                print("  (usual models refused, trying: " + ", ".join(extra) + ")")
+                print("  (usual models refused, trying " + str(len(extra)) + " others...)")
             candidates = extra
         else:
             candidates = [model]
         for m in candidates:
-            if m in tried:
+            if m in tried or m in REFUSED:
                 continue
             tried.append(m)
             text, reason = gemini_call(m, key, body)
+            if not text and ("429" in reason or "limit 0" in reason):
+                REFUSED.add(m)
             if text:
                 if m != remembered_model():
                     try:
@@ -141,6 +160,10 @@ def live_facts(question, key):
                         pass
                 return text[:700], m
             reasons.append(m + ": " + reason)
+    if reasons and all("429" in r for r in reasons):
+        SEARCH_OFF.append(True)
+        reasons = ["Google refused web lookups on all %d models tried (quota). "
+                   "Lookups are paused for this chat; run 'jarvis --check' for details." % len(reasons)]
     return None, reasons
 
 
@@ -163,13 +186,21 @@ def check(key):
     body = json.dumps({"contents": [{"role": "user", "parts": [{"text": "What is today's date? One line."}]}],
                        "tools": [{"google_search": {}}]}).encode()
     plain = json.dumps({"contents": [{"role": "user", "parts": [{"text": "Say OK."}]}]}).encode()
-    order = ([remembered_model()] if remembered_model() else []) + GEMINI_MODELS + names[:3]
-    for m in [m for i, m in enumerate(order) if m not in order[:i]]:
+    print("\nWeb search test, one line per flash model:")
+    order = ([remembered_model()] if remembered_model() else []) + GEMINI_MODELS + names
+    working = None
+    for m in [m for i, m in enumerate(order) if m not in order[:i]][:14]:
         text, reason = gemini_call(m, key, body, timeout=30)
-        print("\n" + m + " with Google Search: " + ("OK: " + text[:80] if text else reason))
-        if not text:
-            text2, reason2 = gemini_call(m, key, plain, timeout=30)
-            print("   without search: " + ("OK" if text2 else reason2))
+        print(" " + m + ": " + ("SEARCH OK" if text else reason[:90]))
+        if text and not working:
+            working = m
+    text2, reason2 = gemini_call("gemini-flash-lite-latest", key, plain, timeout=30)
+    print("\nWithout search, gemini-flash-lite-latest: " + ("OK" if text2 else reason2[:90]))
+    if working:
+        open(MODEL_FILE, "w").write(working)
+        print("\nRESULT: web lookups work with " + working + " (saved; Jarvis uses it first).")
+    else:
+        print("\nRESULT: no model on this key may search the web right now.")
 
 
 def main():
@@ -203,7 +234,8 @@ def main():
                 # Never let Jarvis guess when the web was needed but could not be reached
                 for reason in source:
                     print("  (lookup failed: " + reason + ")")
-                answer = "I couldn't check the web just now, so I won't guess. Try again in a minute."
+                answer = "I couldn't check the web just now, so I won't guess." + (
+                    "" if SEARCH_OFF else " Try again in a minute.")
                 print("jarvis: " + answer + "\n")
                 history += [{"role": "user", "content": question}, {"role": "assistant", "content": answer}]
                 continue
