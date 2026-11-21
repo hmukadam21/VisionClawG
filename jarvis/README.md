@@ -7,4 +7,4 @@ Files for the local Jarvis assistant in `~/Jarvis2.0` on the phone (Ollama + Lla
 - `jarvis_chat.py`: chat with Jarvis in Termux. Questions about prices, news, weather and other
   "now" topics are first looked up with Gemini + Google Search (key read from
   `~/Jarvis2.0/secrets/gemini_key.txt`, never stored here); Jarvis answers from those facts.
-  Start a message with `web ` to force a lookup; `bye` ends. Python standard library only.
+  Start a message with `web` or `search` to force a lookup; `bye` ends. The key file may hold the key in any format (label, quotes, new-style keys with dots). Python standard library only.

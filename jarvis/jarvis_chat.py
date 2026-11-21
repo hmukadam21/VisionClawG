@@ -1,7 +1,7 @@
 # jarvis_chat.py - chat with Jarvis (local Ollama model) plus live facts.
 # Questions about prices, news, weather and other "now" topics are looked up first
 # through Gemini with Google Search; Jarvis then answers in its own style from those facts.
-# Start a message with "web " to force a lookup. Type bye to finish.
+# Start a message with "web" or "search" to force a lookup. Type bye to finish.
 import datetime, json, os, re, sys, urllib.error, urllib.request
 
 HOME = os.path.expanduser("~/Jarvis2.0")
@@ -14,15 +14,22 @@ LIVE = re.compile(
     r"news|headlines?|weather|temperature|forecast|rain|score|scores|who won|results?|"
     r"stocks?|shares?|market|nifty|sensex|gold|silver|oil|bitcoin|crypto|dollar|rupee|dinar|"
     r"exchange|this week|election|president|prime minister|ceo)\b", re.I)
+# "web gold rate", "websearch ...", "search: ...", "google ..." force a lookup
+FORCE = re.compile(r"^(web ?search|web|search|google)\b[:\s]*", re.I)
 
 
 def load_key():
+    """The Gemini key from the secrets file, whatever its format: a label (NAME=), quotes or
+    spaces around it are ignored; the longest key-like run of characters is used."""
     try:
         text = open(KEY_FILE).read()
     except OSError:
-        return None
-    found = re.search(r"AIza[0-9A-Za-z_\-]{30,}", text)
-    return found.group(0) if found else None
+        return None, "no key file at " + KEY_FILE
+    runs = re.findall(r"[A-Za-z0-9_.+/\-]{30,}={0,2}", text)
+    if runs:
+        return max(runs, key=len), ""
+    shape = text.strip()
+    return None, "key file has %d characters starting %r, nothing key-like in it" % (len(shape), shape[:4])
 
 
 def live_facts(question, key):
@@ -61,9 +68,10 @@ def ask_jarvis(messages):
 
 
 def main():
-    key = load_key()
-    print("Jarvis (" + MODEL + ") ready. Live facts: " + ("ON" if key else "OFF - no Gemini key found"))
-    print("Type your message. Start with 'web ' to force a lookup. Type bye to finish.\n")
+    key, problem = load_key()
+    print("Jarvis (" + MODEL + ") ready. Live facts: " + ("ON" if key else "OFF - " + problem))
+    print("Type your message. Start with 'web' or 'search' to force a lookup. Type bye to finish.")
+    print("")
     history = []
     while True:
         try:
@@ -75,9 +83,10 @@ def main():
             continue
         if question.lower() in ("bye", "/bye", "exit", "quit"):
             break
-        forced = question.lower().startswith("web ")
+        force = FORCE.match(question)
+        forced = force is not None
         if forced:
-            question = question[4:].strip()
+            question = question[force.end():].strip() or question
         content = question
         if key and (forced or LIVE.search(question)):
             print("  (looking it up...)")
