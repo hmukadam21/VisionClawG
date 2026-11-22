@@ -12,7 +12,8 @@ Files for the Jarvis assistant in `~/Jarvis2.0` on the phone. Start it with the 
   Ollama drops the personality text).
 - `talk.py`: `talk jane` (or `talk jarvis`) opens a chat page at http://127.0.0.1:5001 with
   chat bubbles, microphone, voice replies, hands-free mode and saved history
-  (`chat_<name>.json`); `talk jane --terminal` is the older Termux chat. Terminal mode: you speak
+  (one file per chat in `chats_<name>/`; the ☰ menu lists chats, starts a new one or deletes
+  one); `talk jane --terminal` is the older Termux chat. Terminal mode: you speak
   (Android speech recognition via Termux:API, if installed) or type (`--type`); the reply is
   shown and spoken in the voice from `voice.txt` (Emma by default) with edge-tts + mpv, through
   the phone's sound output (the glasses when connected). Jane's texting shorthand is spoken

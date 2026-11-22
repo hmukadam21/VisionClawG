@@ -4,7 +4,8 @@
 #   talk jane --terminal   the older chat inside Termux
 # Page: type or tap the microphone; the reply appears in a chat bubble and is spoken in the
 # voice from ~/Jarvis2.0/voice.txt (Emma by default). Hands-free mode listens again after each
-# reply. The conversation is kept in ~/Jarvis2.0/chat_<name>.json and shown when the page opens.
+# reply. The menu button lists all chats (newest first), starts a new one or deletes one; each
+# chat is a file in ~/Jarvis2.0/chats_<name>/ and keeps its own memory.
 # The page is reachable from this phone only (127.0.0.1). Ctrl+C in Termux stops it.
 # Terminal mode: you speak (Termux:API speech recognition, if installed) or type; the answer is
 # spoken through whatever plays the phone's sound (the glasses when they are connected).
@@ -173,23 +174,84 @@ def terminal_main():
 
 
 # ---------- chat page (talk jane) ----------
+# Each conversation is one file in ~/Jarvis2.0/chats_<name>/ (newest first in the Chats list).
+# Older single-chat files (chat_<name>.json and the dated ones set aside) are moved in once.
 
-HISTORY_FILE = os.path.join(HOME, "chat_" + re.sub(r"\W", "_", MODEL) + ".json")
+SAFE_NAME = re.sub(r"\W", "_", MODEL)
+CHAT_DIR = os.path.join(HOME, "chats_" + SAFE_NAME)
 LOCK = threading.Lock()
 
 
-def load_history():
+def stamp():
+    return datetime.datetime.now().strftime("%d %b %H:%M")
+
+
+def chat_path(cid):
+    return os.path.join(CHAT_DIR, re.sub(r"[^\w-]", "", cid) + ".json")
+
+
+def read_chat(cid):
     try:
-        return json.load(open(HISTORY_FILE))
+        return json.load(open(chat_path(cid)))
     except (OSError, ValueError):
-        return []
+        return None
 
 
-def save_history(history):
-    tmp = HISTORY_FILE + ".tmp"
+def write_chat(chat):
+    os.makedirs(CHAT_DIR, exist_ok=True)
+    tmp = chat_path(chat["id"]) + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(history[-500:], f)
-    os.replace(tmp, HISTORY_FILE)
+        json.dump(chat, f)
+    os.replace(tmp, chat_path(chat["id"]))
+
+
+def new_chat(created=None):
+    base = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    cid, n = base, 1
+    while os.path.exists(chat_path(cid)):
+        n += 1
+        cid = "%s-%d" % (base, n)
+    chat = {"id": cid, "created": created or stamp(), "messages": []}
+    write_chat(chat)
+    return chat
+
+
+def list_chats():
+    chats = []
+    for name in os.listdir(CHAT_DIR) if os.path.isdir(CHAT_DIR) else []:
+        if not name.endswith(".json"):
+            continue
+        chat = read_chat(name[:-5])
+        if not chat:
+            continue
+        msgs = chat.get("messages", [])
+        first = next((m["content"] for m in msgs if m.get("role") == "user"), "")
+        chats.append({"id": chat["id"], "title": (first[:40] + ("..." if len(first) > 40 else "")) or "New chat",
+                      "updated": msgs[-1].get("time", "") if msgs else chat.get("created", ""),
+                      "count": len(msgs)})
+    return sorted(chats, key=lambda c: c["id"], reverse=True)
+
+
+def move_old_chats():
+    """Bring chat_<name>.json and the dated copies set aside into the chats folder (once)."""
+    for name in sorted(os.listdir(HOME)):
+        m = re.fullmatch(r"chat_" + re.escape(SAFE_NAME) + r"(?:_(\d{8})_(\d{4}))?\.json", name)
+        if not m:
+            continue
+        path = os.path.join(HOME, name)
+        try:
+            msgs = json.load(open(path))
+        except (OSError, ValueError):
+            continue
+        if isinstance(msgs, list) and msgs:
+            when = datetime.datetime.fromtimestamp(os.path.getmtime(path))
+            chat = new_chat(msgs[0].get("time") or when.strftime("%d %b %H:%M"))
+            if m.group(1):  # keep the original order: the set-aside date becomes the id
+                os.remove(chat_path(chat["id"]))
+                chat["id"] = m.group(1) + "-" + m.group(2) + "00"
+            chat["messages"] = msgs
+            write_chat(chat)
+        os.replace(path, path + ".moved")
 
 
 def tts_mp3(text, voice):
@@ -209,10 +271,11 @@ def tts_mp3(text, voice):
 
 
 class Page(BaseHTTPRequestHandler):
-    history = []
     voice = DEFAULT_VOICE
 
-    def send(self, code, body, kind):
+    def send(self, code, body, kind="application/json"):
+        if not isinstance(body, bytes):
+            body = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(body)))
@@ -220,50 +283,69 @@ class Page(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def body(self):
+        try:
+            return json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        except ValueError:
+            return {}
+
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
+        parts = url.path.strip("/").split("/")
         if url.path == "/":
-            html = PAGE.replace("__NAME__", MODEL.capitalize())
-            self.send(200, html.encode("utf-8"), "text/html; charset=utf-8")
-        elif url.path == "/history":
+            self.send(200, PAGE.replace("__NAME__", MODEL.capitalize()).encode("utf-8"), "text/html; charset=utf-8")
+        elif url.path == "/chats":
             with LOCK:
-                self.send(200, json.dumps(Page.history[-200:]).encode(), "application/json")
+                self.send(200, list_chats())
+        elif len(parts) == 2 and parts[0] == "chats":
+            with LOCK:
+                chat = read_chat(parts[1])
+            self.send(200, chat) if chat else self.send(404, {"error": "chat not found"})
         elif url.path == "/speak":
             text = urllib.parse.parse_qs(url.query).get("text", [""])[0][:1500]
             mp3 = tts_mp3(text, Page.voice)
-            if mp3:
-                self.send(200, mp3, "audio/mpeg")
-            else:
-                self.send(503, b"voice unavailable (internet?)", "text/plain")
+            self.send(200, mp3, "audio/mpeg") if mp3 else self.send(503, b"voice unavailable", "text/plain")
         else:
-            self.send(404, b"not found", "text/plain")
+            self.send(404, {"error": "not found"})
 
     def do_POST(self):
-        if urllib.parse.urlparse(self.path).path != "/chat":
-            return self.send(404, b"not found", "text/plain")
-        try:
-            data = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-        except ValueError:
-            data = {}
+        parts = urllib.parse.urlparse(self.path).path.strip("/").split("/")
+        if parts == ["chats", "new"]:
+            with LOCK:
+                return self.send(200, {"id": new_chat()["id"]})
+        if len(parts) == 3 and parts[0] == "chats" and parts[2] == "delete":
+            with LOCK:
+                try:
+                    os.remove(chat_path(parts[1]))
+                except OSError:
+                    pass
+            return self.send(200, {"ok": True})
+        if parts != ["chat"]:
+            return self.send(404, {"error": "not found"})
+        data = self.body()
         text = str(data.get("text", "")).strip()[:2000]
+        cid = str(data.get("id", ""))
         if not text:
-            return self.send(400, b'{"error": "empty message"}', "application/json")
-        stamp = datetime.datetime.now().strftime("%d %b %H:%M")
+            return self.send(400, {"error": "empty message"})
         with LOCK:
-            Page.history.append({"role": "user", "content": text, "time": stamp})
-            context = [{"role": m["role"], "content": m["content"]} for m in Page.history[-12:]]
+            chat = read_chat(cid) or new_chat()
+            chat["messages"].append({"role": "user", "content": text, "time": stamp()})
+            write_chat(chat)
+            context = [{"role": m["role"], "content": m["content"]} for m in chat["messages"][-12:]]
         try:
             reply = ask(context)
         except Exception as e:
             with LOCK:
-                Page.history.pop()
-            body = json.dumps({"error": MODEL + " did not answer (" + type(e).__name__ + "). Is Ollama running?"})
-            return self.send(502, body.encode(), "application/json")
+                chat = read_chat(chat["id"]) or chat
+                if chat["messages"] and chat["messages"][-1]["role"] == "user":
+                    chat["messages"].pop()
+                write_chat(chat)
+            return self.send(502, {"error": MODEL + " did not answer (" + type(e).__name__ + "). Is Ollama running?"})
         with LOCK:
-            Page.history.append({"role": "assistant", "content": reply,
-                                 "time": datetime.datetime.now().strftime("%d %b %H:%M")})
-            save_history(Page.history)
-        self.send(200, json.dumps({"reply": reply}).encode(), "application/json")
+            chat = read_chat(chat["id"]) or chat
+            chat["messages"].append({"role": "assistant", "content": reply, "time": stamp()})
+            write_chat(chat)
+        self.send(200, {"reply": reply, "id": chat["id"]})
 
     def log_message(self, *args):
         pass
@@ -279,13 +361,15 @@ PAGE = r"""<!DOCTYPE html>
   html, body { margin: 0; height: 100%; }
   body { font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: #eef1f4;
          color: #1d232a; display: flex; flex-direction: column; height: 100dvh; }
-  header { background: #1f2933; color: #fff; padding: 10px 14px; display: flex; align-items: center; gap: 10px; }
-  .avatar { width: 38px; height: 38px; border-radius: 50%; background: #c2577a; display: grid;
-            place-items: center; font-weight: 600; font-size: 18px; }
-  .who { flex: 1; } .who b { display: block; font-size: 17px; } .who small { opacity: .7; font-size: 12px; }
+  header { background: #1f2933; color: #fff; padding: 10px 12px; display: flex; align-items: center; gap: 9px; }
+  .avatar { width: 36px; height: 36px; border-radius: 50%; background: #c2577a; display: grid;
+            place-items: center; font-weight: 600; font-size: 17px; flex: none; }
+  .who { flex: 1; min-width: 0; } .who b { display: block; font-size: 17px; }
+  .who small { opacity: .7; font-size: 12px; }
   header button { background: #2f3b47; color: #fff; border: 0; border-radius: 18px; padding: 7px 10px;
-                  font-size: 13px; }
+                  font-size: 13px; flex: none; }
   header button.on { background: #3a7d5c; }
+  #menuBtn { font-size: 18px; padding: 4px 10px; background: transparent; }
   #log { flex: 1; overflow-y: auto; padding: 12px 10px 4px; }
   .row { display: flex; margin: 4px 0; } .row.me { justify-content: flex-end; }
   .row.note { justify-content: center; }
@@ -298,14 +382,30 @@ PAGE = r"""<!DOCTYPE html>
   .typing { color: #7b8794; letter-spacing: 3px; }
   footer { display: flex; gap: 8px; padding: 8px; background: #e3e7eb;
            padding-bottom: calc(8px + env(safe-area-inset-bottom)); }
-  footer input { flex: 1; border: 0; border-radius: 22px; padding: 11px 16px; font-size: 16px; outline: none; }
+  footer input { flex: 1; min-width: 0; border: 0; border-radius: 22px; padding: 11px 16px; font-size: 16px; outline: none; }
   footer button { width: 46px; height: 46px; border-radius: 50%; border: 0; font-size: 20px;
-                  background: #1f2933; color: #fff; }
+                  background: #1f2933; color: #fff; flex: none; }
   footer button.on { background: #c0392b; animation: pulse 1s infinite; }
   @keyframes pulse { 50% { opacity: .6; } }
+  #shade { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: none; }
+  #panel { position: fixed; top: 0; bottom: 0; left: 0; width: min(84vw, 340px); background: #fff;
+           transform: translateX(-105%); transition: transform .2s; display: flex; flex-direction: column;
+           box-shadow: 2px 0 12px rgba(0,0,0,.2); }
+  body.open #panel { transform: none; } body.open #shade { display: block; }
+  #panel h2 { margin: 0; padding: 16px; font-size: 17px; background: #1f2933; color: #fff; }
+  #newBtn { margin: 12px; padding: 12px; border: 0; border-radius: 10px; background: #3a7d5c;
+            color: #fff; font-size: 15px; }
+  #list { flex: 1; overflow-y: auto; }
+  .item { display: flex; align-items: center; border-bottom: 1px solid #edf0f2; }
+  .item.cur { background: #eef6f1; }
+  .item .open { flex: 1; min-width: 0; padding: 11px 14px; background: none; border: 0; text-align: left; font: inherit; color: inherit; }
+  .item .open b { display: block; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item .open small { color: #7b8794; font-size: 12px; }
+  .item .del { background: none; border: 0; color: #a0a8b0; font-size: 18px; padding: 12px 14px; }
 </style></head>
 <body>
 <header>
+  <button id="menuBtn" title="Chats">&#9776;</button>
   <div class="avatar">__NAME__</div>
   <div class="who"><b>__NAME__</b><small id="status">on this phone</small></div>
   <button id="voiceBtn" title="Voice on or off">voice</button>
@@ -317,16 +417,18 @@ PAGE = r"""<!DOCTYPE html>
   <input id="text" placeholder="Message" autocomplete="off" enterkeyhint="send">
   <button id="sendBtn" title="Send">&#10148;</button>
 </footer>
+<div id="shade"></div>
+<nav id="panel"><h2>Chats with __NAME__</h2><button id="newBtn">+ New chat</button><div id="list"></div></nav>
 <script>
-const log = document.getElementById("log"), input = document.getElementById("text");
-const mic = document.getElementById("mic"), statusEl = document.getElementById("status");
-const voiceBtn = document.getElementById("voiceBtn"), freeBtn = document.getElementById("freeBtn");
+const $ = id => document.getElementById(id);
+const log = $("log"), input = $("text"), mic = $("mic"), statusEl = $("status");
 const audio = new Audio();
 document.querySelector(".avatar").textContent = "__NAME__".charAt(0);
-function load(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v === "1"; } catch (e) { return d; } }
-function store(k, v) { try { localStorage.setItem(k, v ? "1" : "0"); } catch (e) {} }
-let voiceOn = load("voiceOn", true), handsFree = load("handsFree", false), busy = false, misses = 0;
-function paint() { voiceBtn.classList.toggle("on", voiceOn); freeBtn.classList.toggle("on", handsFree); }
+function load(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } }
+function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+let voiceOn = load("voiceOn", "1") === "1", handsFree = load("handsFree", "0") === "1";
+let busy = false, misses = 0, current = null;
+function paint() { $("voiceBtn").classList.toggle("on", voiceOn); $("freeBtn").classList.toggle("on", handsFree); }
 paint();
 function now() {
   const d = new Date(), p = n => String(n).padStart(2, "0");
@@ -339,19 +441,54 @@ function bubble(kind, text, time) {
   if (time) { const t = document.createElement("span"); t.className = "time"; t.textContent = time; b.appendChild(t); }
   row.appendChild(b); log.appendChild(row); log.scrollTop = log.scrollHeight; return row;
 }
-async function loadHistory() {
-  try { (await (await fetch("/history")).json()).forEach(m => bubble(m.role, m.content, m.time)); }
-  catch (e) { bubble("note", "Could not load earlier messages."); }
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  return r.json();
 }
+async function openChat(id) {
+  const chat = await api("/chats/" + id);
+  if (chat.error) return false;
+  current = chat.id; store("chat", current); log.innerHTML = "";
+  chat.messages.forEach(m => bubble(m.role, m.content, m.time));
+  if (!chat.messages.length) bubble("note", "New chat. Say hello.");
+  return true;
+}
+async function newChat() { const r = await api("/chats/new", {}); await openChat(r.id); closePanel(); }
+async function start() {
+  try {
+    const chats = await api("/chats"), saved = load("chat", "");
+    const pick = chats.find(c => c.id === saved) || chats[0];
+    if (!(pick && await openChat(pick.id))) await newChat();
+  } catch (e) { bubble("note", "Could not reach Termux. Is talk still running?"); }
+}
+async function showList() {
+  const chats = await api("/chats"), list = $("list"); list.innerHTML = "";
+  chats.forEach(c => {
+    const item = document.createElement("div"); item.className = "item" + (c.id === current ? " cur" : "");
+    const open = document.createElement("button"); open.className = "open";
+    const t = document.createElement("b"); t.textContent = c.title;
+    const s = document.createElement("small"); s.textContent = c.updated + " · " + c.count + " messages";
+    open.append(t, s); open.onclick = async () => { await openChat(c.id); closePanel(); };
+    const del = document.createElement("button"); del.className = "del"; del.textContent = "✕"; del.title = "Delete";
+    del.onclick = async () => {
+      if (!confirm("Delete this chat for good?\n" + c.title)) return;
+      await api("/chats/" + c.id + "/delete", {});
+      if (c.id === current) { current = null; log.innerHTML = ""; }
+      showList(); if (!current) start();
+    };
+    item.append(open, del); list.appendChild(item);
+  });
+}
+function openPanel() { document.body.classList.add("open"); showList(); }
+function closePanel() { document.body.classList.remove("open"); }
 async function send(text) {
   text = (text || "").trim(); if (!text || busy) return;
   busy = true; input.value = ""; bubble("user", text, now());
   const typing = bubble("them", "..."); typing.firstChild.classList.add("typing"); statusEl.textContent = "typing...";
   try {
-    const r = await fetch("/chat", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({text})});
-    const d = await r.json(); typing.remove();
+    const d = await api("/chat", {id: current, text}); typing.remove();
     if (d.error) { bubble("note", d.error); }
-    else { bubble("them", d.reply, now()); if (voiceOn) say(d.reply); else if (handsFree) listen(); }
+    else { current = d.id; store("chat", current); bubble("them", d.reply, now()); if (voiceOn) say(d.reply); else if (handsFree) listen(); }
   } catch (e) { typing.remove(); bubble("note", "Lost the connection to Termux. Is talk still running?"); }
   statusEl.textContent = "on this phone"; busy = false;
 }
@@ -370,7 +507,7 @@ function listen() {
   mic.classList.add("on"); statusEl.textContent = "listening...";
   rec.onresult = e => {
     misses = 0; const t = e.results[0][0].transcript;
-    if (/^\s*(bye|goodbye|stop)\s*$/i.test(t)) { handsFree = false; store("handsFree", false); paint(); bubble("user", t, now()); return; }
+    if (/^\s*(bye|goodbye|stop)\s*$/i.test(t)) { handsFree = false; store("handsFree", "0"); paint(); bubble("user", t, now()); return; }
     send(t);
   };
   rec.onerror = e => {
@@ -382,18 +519,20 @@ function listen() {
   rec.start();
 }
 mic.onclick = () => { if (rec) { rec.stop(); return; } audio.pause(); listen(); };
-document.getElementById("sendBtn").onclick = () => send(input.value);
+$("sendBtn").onclick = () => send(input.value);
 input.addEventListener("keydown", e => { if (e.key === "Enter") send(input.value); });
-voiceBtn.onclick = () => { voiceOn = !voiceOn; store("voiceOn", voiceOn); if (!voiceOn) audio.pause(); paint(); };
-freeBtn.onclick = () => { handsFree = !handsFree; store("handsFree", handsFree); paint(); if (handsFree && !rec && !busy) listen(); };
-loadHistory();
+$("voiceBtn").onclick = () => { voiceOn = !voiceOn; store("voiceOn", voiceOn ? "1" : "0"); if (!voiceOn) audio.pause(); paint(); };
+$("freeBtn").onclick = () => { handsFree = !handsFree; store("handsFree", handsFree ? "1" : "0"); paint(); if (handsFree && !rec && !busy) listen(); };
+$("menuBtn").onclick = openPanel; $("shade").onclick = closePanel; $("newBtn").onclick = newChat;
+start();
 </script>
 </body></html>
 """
 
 
 def web_main():
-    Page.history = load_history()
+    with LOCK:
+        move_old_chats()
     Page.voice = voice_name()
     try:
         server = ThreadingHTTPServer(("127.0.0.1", PORT), Page)
@@ -402,7 +541,7 @@ def web_main():
         return
     url = "http://127.0.0.1:%d" % PORT
     print("Chat with " + MODEL + " is open at " + url + " (voice " + Page.voice + ").")
-    print("Keep this Termux session running. Ctrl+C stops the page.")
+    print("Chats are kept in " + CHAT_DIR + ". Keep this Termux session running; Ctrl+C stops the page.")
     if shutil.which("termux-open-url"):
         subprocess.Popen(["termux-open-url", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
