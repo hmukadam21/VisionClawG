@@ -6,18 +6,27 @@
 # voice from ~/Jarvis2.0/voice.txt (Emma by default). Hands-free mode listens again after each
 # reply. The menu button lists all chats (newest first), starts a new one or deletes one; each
 # chat is a file in ~/Jarvis2.0/chats_<name>/ and keeps its own memory.
+# Photos: the camera button sends a photo (made small in the browser first). The photo reader
+# (a local vision model) describes it, and Jane or Jarvis answers from that description, in their
+# own style and memory. The time it took is printed in Termux. "--threads N" sets how many
+# processor cores the photo reader uses (default 4).
 # The page is reachable from this phone only (127.0.0.1). Ctrl+C in Termux stops it.
 # Terminal mode: you speak (Termux:API speech recognition, if installed) or type; the answer is
 # spoken through whatever plays the phone's sound (the glasses when they are connected).
 # Jane's texting shorthand ("m ok wen r u") is spoken as full words; emojis are not spoken.
 # Say or type "bye" to finish. Needs Ollama running, edge-tts and mpv; internet for the voice.
-import datetime, json, os, re, shutil, subprocess, sys, tempfile, threading, urllib.parse, urllib.request
+import datetime, json, os, re, shutil, subprocess, sys, tempfile, threading, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOME = os.path.expanduser("~/Jarvis2.0")
 NAMES = [a for a in sys.argv[1:] if not a.startswith("--")]
 MODEL = NAMES[0] if NAMES else "jane"
 PORT = 5001
+VISION_MODEL = "huihui_ai/qwen3-vl-abliterated:2b-instruct"
+_t = [a for a in sys.argv if a.startswith("--threads")]
+VISION_THREADS = int(_t[0].split("=")[-1]) if _t and "=" in _t[0] else 4
+PHOTO_PROMPT = ("Describe this photo in two short sentences: the main things or people in it, any "
+                "readable text, and the setting. Be factual and specific.")
 OLLAMA_URL = "http://localhost:11434/api/chat"
 DEFAULT_VOICE = "en-US-EmmaMultilingualNeural"
 
@@ -225,7 +234,7 @@ def list_chats():
         if not chat:
             continue
         msgs = chat.get("messages", [])
-        first = next((m["content"] for m in msgs if m.get("role") == "user"), "")
+        first = next(((m["content"] or "(photo)") for m in msgs if m.get("role") == "user"), "")
         chats.append({"id": chat["id"], "title": (first[:40] + ("..." if len(first) > 40 else "")) or "New chat",
                       "updated": msgs[-1].get("time", "") if msgs else chat.get("created", ""),
                       "count": len(msgs)})
@@ -268,6 +277,41 @@ def tts_mp3(text, voice):
         return open(out, "rb").read()
     except (OSError, subprocess.TimeoutExpired):
         return None
+
+
+def describe_photo(data_url):
+    """What the photo shows, from the local photo reader: (text, None) or (None, problem)."""
+    b64 = data_url.split(",", 1)[-1]
+    body = json.dumps({"model": VISION_MODEL, "stream": False,
+                       "messages": [{"role": "user", "content": PHOTO_PROMPT, "images": [b64]}],
+                       "options": {"num_thread": VISION_THREADS, "temperature": 0.2, "num_predict": 150}}).encode()
+    req = urllib.request.Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"})
+    started = datetime.datetime.now()
+    try:
+        with urllib.request.urlopen(req, timeout=900) as resp:
+            d = json.load(resp)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, "the photo reader (" + VISION_MODEL + ") is not installed"
+        return None, "the photo reader failed (HTTP %d)" % e.code
+    except Exception as e:
+        return None, "the photo reader did not answer (" + type(e).__name__ + ")"
+    secs = (datetime.datetime.now() - started).total_seconds()
+    print("photo read in %.1f s: %s pieces in %.1f s, %d cores" % (
+        secs, d.get("prompt_eval_count", "?"), d.get("prompt_eval_duration", 0) / 1e9, VISION_THREADS))
+    text = re.sub(r"\s+", " ", d.get("message", {}).get("content", "")).strip()
+    return (text, None) if text else (None, "the photo reader gave no description")
+
+
+def model_context(messages):
+    """The last messages as the chat model sees them (a photo becomes its description)."""
+    out = []
+    for m in messages[-12:]:
+        content = m["content"]
+        if m.get("seen"):
+            content = (content + "\n" if content else "") + "[Photo sent with this message. It shows: " + m["seen"] + "]"
+        out.append({"role": m["role"], "content": content})
+    return out
 
 
 class Page(BaseHTTPRequestHandler):
@@ -324,14 +368,23 @@ class Page(BaseHTTPRequestHandler):
             return self.send(404, {"error": "not found"})
         data = self.body()
         text = str(data.get("text", "")).strip()[:2000]
+        image = str(data.get("image") or "")
         cid = str(data.get("id", ""))
-        if not text:
+        if not text and not image:
             return self.send(400, {"error": "empty message"})
+        if image and (not image.startswith("data:image/") or len(image) > 600000):
+            return self.send(400, {"error": "that photo could not be used"})
+        message = {"role": "user", "content": text, "time": stamp()}
+        if image:
+            seen, problem = describe_photo(image)
+            if problem:
+                return self.send(502, {"error": "Could not read the photo: " + problem + "."})
+            message.update({"image": image, "seen": seen})
         with LOCK:
             chat = read_chat(cid) or new_chat()
-            chat["messages"].append({"role": "user", "content": text, "time": stamp()})
+            chat["messages"].append(message)
             write_chat(chat)
-            context = [{"role": m["role"], "content": m["content"]} for m in chat["messages"][-12:]]
+            context = model_context(chat["messages"])
         try:
             reply = ask(context)
         except Exception as e:
@@ -387,6 +440,12 @@ PAGE = r"""<!DOCTYPE html>
                   background: #1f2933; color: #fff; flex: none; }
   footer button.on { background: #c0392b; animation: pulse 1s infinite; }
   @keyframes pulse { 50% { opacity: .6; } }
+  .bubble img { display: block; max-width: 220px; max-height: 260px; border-radius: 8px; margin-bottom: 4px; }
+  #pending { display: none; align-items: center; gap: 8px; padding: 6px 10px; background: #e3e7eb; }
+  #pending.show { display: flex; } #pending img { height: 54px; border-radius: 6px; }
+  #pending span { flex: 1; font-size: 13px; color: #52606d; }
+  #pending button { border: 0; background: none; font-size: 18px; color: #7b8794; }
+  #photo { display: none; }
   #shade { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: none; }
   #panel { position: fixed; top: 0; bottom: 0; left: 0; width: min(84vw, 340px); background: #fff;
            transform: translateX(-105%); transition: transform .2s; display: flex; flex-direction: column;
@@ -412,7 +471,10 @@ PAGE = r"""<!DOCTYPE html>
   <button id="freeBtn" title="Listen again after each reply">hands-free</button>
 </header>
 <div id="log"></div>
+<div id="pending"><img id="pendingImg" alt=""><span>Photo ready. Add a question or just send.</span><button id="dropPhoto" title="Remove photo">&#10005;</button></div>
 <footer>
+  <input type="file" id="photo" accept="image/*">
+  <button id="photoBtn" title="Send a photo">&#128247;</button>
   <button id="mic" title="Speak">&#127908;</button>
   <input id="text" placeholder="Message" autocomplete="off" enterkeyhint="send">
   <button id="sendBtn" title="Send">&#10148;</button>
@@ -434,10 +496,12 @@ function now() {
   const d = new Date(), p = n => String(n).padStart(2, "0");
   return p(d.getDate()) + " " + d.toLocaleString("en", {month: "short"}) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
 }
-function bubble(kind, text, time) {
+function bubble(kind, text, time, image) {
   const row = document.createElement("div");
   row.className = "row " + (kind === "user" ? "me" : kind === "note" ? "note" : "them");
-  const b = document.createElement("div"); b.className = "bubble"; b.textContent = text;
+  const b = document.createElement("div"); b.className = "bubble";
+  if (image) { const im = document.createElement("img"); im.src = image; im.alt = "photo"; b.appendChild(im); }
+  if (text) b.appendChild(document.createTextNode(text));
   if (time) { const t = document.createElement("span"); t.className = "time"; t.textContent = time; b.appendChild(t); }
   row.appendChild(b); log.appendChild(row); log.scrollTop = log.scrollHeight; return row;
 }
@@ -449,7 +513,7 @@ async function openChat(id) {
   const chat = await api("/chats/" + id);
   if (chat.error) return false;
   current = chat.id; store("chat", current); log.innerHTML = "";
-  chat.messages.forEach(m => bubble(m.role, m.content, m.time));
+  chat.messages.forEach(m => bubble(m.role, m.content, m.time, m.image));
   if (!chat.messages.length) bubble("note", "New chat. Say hello.");
   return true;
 }
@@ -481,12 +545,33 @@ async function showList() {
 }
 function openPanel() { document.body.classList.add("open"); showList(); }
 function closePanel() { document.body.classList.remove("open"); }
+let photo = null;
+async function shrink(file, max) {  // photo made small in the browser: long side `max` pixels, JPEG
+  const url = URL.createObjectURL(file), img = new Image();
+  await new Promise((ok, bad) => { img.onload = ok; img.onerror = bad; img.src = url; });
+  const k = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+  const c = document.createElement("canvas");
+  c.width = Math.round(img.naturalWidth * k); c.height = Math.round(img.naturalHeight * k);
+  c.getContext("2d").drawImage(img, 0, 0, c.width, c.height); URL.revokeObjectURL(url);
+  return c.toDataURL("image/jpeg", 0.85);
+}
+function setPhoto(data) {
+  photo = data; $("pending").classList.toggle("show", !!data);
+  $("pendingImg").src = data || ""; input.placeholder = data ? "Question about the photo (optional)" : "Message";
+}
+$("photoBtn").onclick = () => $("photo").click();
+$("photo").onchange = async () => {
+  const f = $("photo").files[0]; $("photo").value = ""; if (!f) return;
+  try { setPhoto(await shrink(f, 384)); } catch (e) { bubble("note", "That photo could not be opened."); }
+};
+$("dropPhoto").onclick = () => setPhoto(null);
 async function send(text) {
-  text = (text || "").trim(); if (!text || busy) return;
-  busy = true; input.value = ""; bubble("user", text, now());
-  const typing = bubble("them", "..."); typing.firstChild.classList.add("typing"); statusEl.textContent = "typing...";
+  text = (text || "").trim(); if ((!text && !photo) || busy) return;
+  const image = photo; busy = true; input.value = ""; setPhoto(null); bubble("user", text, now(), image);
+  const typing = bubble("them", "..."); typing.firstChild.classList.add("typing");
+  statusEl.textContent = image ? "looking at the photo..." : "typing...";
   try {
-    const d = await api("/chat", {id: current, text}); typing.remove();
+    const d = await api("/chat", {id: current, text, image}); typing.remove();
     if (d.error) { bubble("note", d.error); }
     else { current = d.id; store("chat", current); bubble("them", d.reply, now()); if (voiceOn) say(d.reply); else if (handsFree) listen(); }
   } catch (e) { typing.remove(); bubble("note", "Lost the connection to Termux. Is talk still running?"); }
