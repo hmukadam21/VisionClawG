@@ -50,8 +50,45 @@ def to_speech(text):
     return "".join(SPOKEN.get(w.lower(), w) if re.fullmatch(r"\w+", w) else w for w in words).strip()
 
 
+# The voice gets full words: Jane's own model rewrites her texting shorthand (it knows her
+# style, so it also handles new abbreviations); the word list above is the backup.
+REWRITE = ("You rewrite casual text messages into full, plain spoken English so a voice can read "
+           "them aloud. Expand every abbreviation, slang spelling and texting shorthand into full "
+           "words. Keep the same meaning, the same person speaking and the same tone. Remove emojis. "
+           "Output only the rewritten message, nothing else.")
+REWRITE_EXAMPLES = [
+    ("m ok wen r u coming home? 🥺", "i'm okay, when are you coming home?"),
+    ("lol gud nyt babe, txt me tmrw 😘", "haha, good night babe, text me tomorrow."),
+    ("wbu? hw ws ur day", "what about you? how was your day?"),
+]
+
+
+def spoken_words(text):
+    """What the voice should say: full words, no emojis."""
+    clean = re.sub(r"\s+", " ", EMOJI.sub(" ", text)).strip()
+    if not MODEL.lower().startswith("jane") or not re.search(r"\w", clean):
+        return clean
+    messages = [{"role": "system", "content": REWRITE}]
+    for short, full in REWRITE_EXAMPLES:
+        messages += [{"role": "user", "content": short}, {"role": "assistant", "content": full}]
+    messages.append({"role": "user", "content": clean})
+    try:
+        body = json.dumps({"model": MODEL, "messages": messages, "stream": False,
+                           "options": {"temperature": 0, "num_predict": 120}}).encode()
+        req = urllib.request.Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            out = json.load(resp)["message"]["content"]
+        lines = [l.strip().strip('"').strip() for l in out.splitlines() if re.search(r"\w", l)]
+        full = EMOJI.sub(" ", lines[0]).strip() if lines else ""
+        if full and len(full) <= 3 * len(clean) + 40:
+            return to_speech(full)  # the word list catches anything left over
+    except Exception:
+        pass
+    return to_speech(clean)
+
+
 def speak(text, voice):
-    said = to_speech(text)
+    said = spoken_words(text)
     if not re.search(r"\w", said):
         return
     out = os.path.join(tempfile.gettempdir(), "talk_reply.mp3")
@@ -157,7 +194,7 @@ def save_history(history):
 
 def tts_mp3(text, voice):
     """MP3 bytes of the text in the voice, or None."""
-    said = to_speech(text)
+    said = spoken_words(text)
     if not re.search(r"\w", said):
         return None
     out = os.path.join(tempfile.gettempdir(), "talk_web_%d.mp3" % threading.get_ident())
