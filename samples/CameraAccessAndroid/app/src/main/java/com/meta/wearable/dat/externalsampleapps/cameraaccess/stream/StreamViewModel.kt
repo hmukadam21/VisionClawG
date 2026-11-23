@@ -427,6 +427,8 @@ class StreamViewModel(
           cameraOnDemand = onDemand,
       )
     }
+    // v1.7.3: keeps Gemini hearing you with the screen off (Android Auto, phone in a pocket)
+    StreamingService.start(getApplication())
     if (!onDemand) switchOnPhoneCamera()
     DebugLog.log("STREAM", "phone mode started (camera ${if (onDemand) "ON DEMAND" else "LIVE"})")
     startHeartbeat()

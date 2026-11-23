@@ -90,13 +90,20 @@ class StreamingService : Service() {
               ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
       )
     } catch (e: Exception) {
-      // E.g. microphone permission missing: keep at least the glasses connection alive.
-      DebugLog.log("SERVICE", "microphone foreground type REFUSED (${e.javaClass.simpleName}: ${e.message}); running without it, mic may be muted when locked")
-      startForeground(
-          NOTIFICATION_ID,
-          notification,
-          ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
-      )
+      DebugLog.log("SERVICE", "full foreground type REFUSED (${e.javaClass.simpleName}: ${e.message})")
+      // v1.7.3: phone mode may lack the Bluetooth permission: microphone alone first, then the
+      // glasses connection alone (microphone permission missing)
+      try {
+        startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        DebugLog.log("SERVICE", "running as microphone only")
+      } catch (e2: Exception) {
+        DebugLog.log("SERVICE", "microphone type REFUSED too (${e2.javaClass.simpleName}); mic may be muted when locked")
+        startForeground(
+            NOTIFICATION_ID,
+            notification,
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+        )
+      }
     }
 
     acquireWakeLock()

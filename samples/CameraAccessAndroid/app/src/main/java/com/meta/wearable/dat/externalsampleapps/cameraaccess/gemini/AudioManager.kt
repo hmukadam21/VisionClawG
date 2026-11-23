@@ -59,7 +59,7 @@ class AudioManager {
      * Call before startPlayback(forGlassesMic = false) and startCapture().
      * @return true if the glasses were selected as the communication device.
      */
-    fun startBluetoothCallRoute(): Boolean {
+    fun startBluetoothCallRoute(preferNotGlasses: Boolean = false): Boolean {
         val system = SettingsManager.appContext?.getSystemService(android.media.AudioManager::class.java)
             ?: return false
         val devices = system.availableCommunicationDevices
@@ -67,8 +67,14 @@ class AudioManager {
             "AUDIO",
             "call devices available: " + devices.joinToString { "${it.productName} (type ${it.type})" },
         )
-        val glasses = devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
-            ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
+        val callDevices =
+            devices.filter { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO } +
+                devices.filter { it.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
+        // Phone mode (v1.7.3): the car (Android Auto) or a headset, not the glasses, if both are on
+        val glassesName = Regex("(?i)ray.?ban|meta|oakley")
+        val glasses =
+            (if (preferNotGlasses) callDevices.firstOrNull { !glassesName.containsMatchIn(it.productName.toString()) } else null)
+                ?: callDevices.firstOrNull()
         if (glasses == null) {
             DebugLog.log("AUDIO", "no Bluetooth call device found: cannot use the Bluetooth-call route")
             return false
