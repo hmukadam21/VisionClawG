@@ -40,8 +40,8 @@ android {
     minSdk = 31
     // Kept at 34 so Android behaviour of the app does not change in this upgrade.
     targetSdk = 34
-    versionCode = 11
-    versionName = "1.7.1-look"
+    versionCode = 12
+    versionName = "1.7.2-look"
 
     // Only the phone's processor type (64-bit ARM, e.g. Xiaomi 14T Pro): the app file shrinks
     // a lot, so updating over the old version is quicker.

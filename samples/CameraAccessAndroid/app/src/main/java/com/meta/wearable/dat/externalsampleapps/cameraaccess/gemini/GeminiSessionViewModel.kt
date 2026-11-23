@@ -132,10 +132,12 @@ class GeminiSessionViewModel : ViewModel() {
         reconnecting = false
         reconnectAttempts = 0
         geminiService.clearResumption() // a new tap on the AI button = a new conversation
-        // Glasses mode: the look tool; with the on-demand camera also the high-resolution request
+        // Glasses mode: the look tool; with the on-demand camera also the high-resolution request.
+        // Phone mode (v1.7.2): the same on-demand camera, so the look tool there too.
         val glasses = streamingMode == StreamingMode.GLASSES
-        val onDemand = glasses && SettingsManager.cameraOnDemand
-        geminiService.lookToolEnabled = glasses
+        val onDemand =
+            if (glasses) SettingsManager.cameraOnDemand else SettingsManager.phoneCameraOnDemand
+        geminiService.lookToolEnabled = glasses || onDemand
         geminiService.liveVideo = !onDemand
         geminiService.requestHighMediaResolution = onDemand
         _uiState.value = _uiState.value.copy(isGeminiActive = true)

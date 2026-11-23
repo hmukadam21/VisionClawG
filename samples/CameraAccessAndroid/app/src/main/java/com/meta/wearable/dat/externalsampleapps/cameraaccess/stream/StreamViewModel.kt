@@ -123,6 +123,8 @@ class StreamViewModel(
     // Camera stays on this long after a look, so follow-up questions are answered at once
     // (v1.7.1: 45 s; with 20 s a follow-up 26 s later found the camera already off)
     private const val LOOK_LINGER_MS = 45_000L
+    // Phone camera: focus and light settle for this long after its first picture
+    private const val PHONE_SETTLE_MS = 900L
     // Look stream: 720x1280 at 7 fps (the first picture comes about 2 s after the camera starts)
     private const val LOOK_FRAME_RATE = 7
     private const val LOOK_JPEG_QUALITY = 90
@@ -174,6 +176,13 @@ class StreamViewModel(
   private val lookCameraJobs = mutableListOf<Job>()
   // Waits LOOK_LINGER_MS, then switches the look camera off
   @Volatile private var lookLingerJob: Job? = null
+
+  // Phone mode, on-demand camera (v1.7.2): the phone camera is on only around a look
+  private var phoneLifecycleOwner: LifecycleOwner? = null
+  @Volatile private var phoneCameraOn = false
+  @Volatile private var lastPhoneFrame: Bitmap? = null
+  @Volatile private var lastPhoneFrameAt = 0L
+  @Volatile private var firstPhoneFrameAt = 0L
 
   // VisionClaw additions
   var geminiViewModel: GeminiSessionViewModel? = null
@@ -401,30 +410,120 @@ class StreamViewModel(
     leaveStreaming(message)
   }
 
-  // MARK: - Phone camera mode (unchanged)
+  // MARK: - Phone camera mode
 
+  /**
+   * "Start on Phone". v1.7.2: follows the Camera setting like the glasses. On demand = the phone
+   * camera stays off and is switched on only when Gemini looks (or the photo button is tapped),
+   * then off again LOOK_LINGER_MS after the last look. Live = always on, as before.
+   */
   fun startPhoneCamera(lifecycleOwner: LifecycleOwner) {
-    onDemand = false
-    val manager = PhoneCameraManager(getApplication())
-    phoneCameraManager = manager
-
-    manager.onFrameCaptured = { bitmap ->
-      _uiState.update { it.copy(videoFrame = bitmap) }
-      // Forward to Gemini (throttled inside the VM)
-      geminiViewModel?.sendVideoFrameIfThrottled(bitmap)
-      // Forward to WebRTC (every frame)
-      webrtcViewModel?.pushVideoFrame(bitmap)
-    }
-
+    onDemand = SettingsManager.phoneCameraOnDemand
+    phoneLifecycleOwner = lifecycleOwner
     _uiState.update {
       it.copy(
           streamingMode = StreamingMode.PHONE,
           streamSessionState = StreamState.STREAMING,
+          cameraOnDemand = onDemand,
       )
     }
-    manager.start(lifecycleOwner)
-    DebugLog.log("STREAM", "phone camera mode started")
+    if (!onDemand) switchOnPhoneCamera()
+    DebugLog.log("STREAM", "phone mode started (camera ${if (onDemand) "ON DEMAND" else "LIVE"})")
     startHeartbeat()
+  }
+
+  /** Switches the phone camera on (main thread). False when there is no screen to bind it to. */
+  private fun switchOnPhoneCamera(): Boolean {
+    if (phoneCameraOn) return true
+    val owner = phoneLifecycleOwner ?: return false
+    val manager =
+        phoneCameraManager
+            ?: PhoneCameraManager(getApplication()).also { created ->
+              created.onFrameCaptured = { bitmap -> onPhoneFrame(bitmap) }
+              phoneCameraManager = created
+            }
+    lastPhoneFrame = null
+    lastPhoneFrameAt = 0L
+    firstPhoneFrameAt = 0L
+    phoneCameraOn = true
+    manager.start(owner)
+    return true
+  }
+
+  /** A picture from the phone camera (called on the camera's thread). */
+  private fun onPhoneFrame(bitmap: Bitmap) {
+    if (!phoneCameraOn) return // a late picture after the camera was switched off
+    val now = SystemClock.elapsedRealtime()
+    if (firstPhoneFrameAt == 0L) firstPhoneFrameAt = now
+    lastPhoneFrame = bitmap
+    lastPhoneFrameAt = now
+    _uiState.update { it.copy(videoFrame = bitmap) }
+    // Live mode only: Gemini watches the video (throttled inside the VM)
+    if (!onDemand) geminiViewModel?.sendVideoFrameIfThrottled(bitmap)
+    // Forward to WebRTC (every frame)
+    webrtcViewModel?.pushVideoFrame(bitmap)
+  }
+
+  /** Switches the phone camera off and clears the screen, so it is plain that it is off. */
+  private fun switchOffPhoneCamera(reason: String) {
+    if (!phoneCameraOn) return
+    phoneCameraOn = false
+    phoneCameraManager?.stop()
+    lastPhoneFrame = null
+    lastPhoneFrameAt = 0L
+    firstPhoneFrameAt = 0L
+    _uiState.update { it.copy(videoFrame = null) }
+    DebugLog.log("LOOK", "phone camera off ($reason)")
+  }
+
+  /** On-demand phone look: camera on (or still on), one settled picture, then off later. */
+  private suspend fun phoneLook(): LookResult {
+    val askedAt = SystemClock.elapsedRealtime()
+    _uiState.update { it.copy(isLooking = true) }
+    try {
+      lookLingerJob?.let {
+        it.cancel()
+        it.join()
+      }
+      lookLingerJob = null
+      val reuse = phoneCameraOn && lastPhoneFrame != null
+      if (!reuse) {
+        val on = withContext(Dispatchers.Main) { switchOnPhoneCamera() }
+        if (!on) return LookResult.Failed("the phone camera could not be switched on")
+      } else {
+        DebugLog.log("LOOK", "phone camera still on from the last look")
+      }
+      val picture =
+          withTimeoutOrNull(LOOK_FIRST_FRAME_TIMEOUT_MS) {
+            if (reuse) {
+              while (lastPhoneFrameAt <= askedAt) delay(40)
+            } else {
+              // The first pictures of a camera are often dark or blurred: wait for it to settle
+              while (firstPhoneFrameAt == 0L ||
+                  lastPhoneFrameAt < firstPhoneFrameAt + PHONE_SETTLE_MS) delay(40)
+            }
+            lastPhoneFrame
+          } ?: lastPhoneFrame
+      if (picture == null) {
+        DebugLog.log("LOOK", "no picture from the phone camera")
+        return LookResult.Failed("no picture from the phone camera (keep the app open on screen)")
+      }
+      DebugLog.log(
+          "LOOK",
+          "phone look done in ${SystemClock.elapsedRealtime() - askedAt} ms " +
+              "(${picture.width}x${picture.height})",
+      )
+      return LookResult.Photo(picture)
+    } finally {
+      _uiState.update { it.copy(isLooking = false) }
+      if (phoneCameraOn) {
+        lookLingerJob =
+            viewModelScope.launch {
+              delay(LOOK_LINGER_MS)
+              switchOffPhoneCamera("no look for ${LOOK_LINGER_MS / 1000} s")
+            }
+      }
+    }
   }
 
   // MARK: - Stop
@@ -466,8 +565,11 @@ class StreamViewModel(
     stream = null
     closeSession()
 
+    phoneCameraOn = false
     phoneCameraManager?.stop()
     phoneCameraManager = null
+    phoneLifecycleOwner = null
+    lastPhoneFrame = null
     _uiState.update { INITIAL_STATE }
   }
 
@@ -479,8 +581,9 @@ class StreamViewModel(
       return
     }
 
-    // On-demand camera: the photo button takes one look, then offers to share it
-    if (onDemand && uiState.value.streamingMode == StreamingMode.GLASSES) {
+    // On-demand camera (glasses, and phone since v1.7.2): the photo button takes one look,
+    // then offers to share it
+    if (onDemand) {
       _uiState.update { it.copy(isCapturing = true) }
       viewModelScope.launch {
         DebugLog.log("LOOK", "photo button tapped")
@@ -551,7 +654,8 @@ class StreamViewModel(
         try {
           when {
             _uiState.value.streamingMode == StreamingMode.PHONE ->
-                _uiState.value.videoFrame?.let { LookResult.Photo(it) }
+                if (onDemand) phoneLook()
+                else _uiState.value.videoFrame?.let { LookResult.Photo(it) }
                     ?: LookResult.Failed("no picture from the phone camera yet")
             !onDemand -> liveLook()
             else -> onDemandLook(fineDetail)

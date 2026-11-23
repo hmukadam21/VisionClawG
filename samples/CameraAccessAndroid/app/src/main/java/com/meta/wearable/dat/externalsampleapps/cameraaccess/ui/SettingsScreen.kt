@@ -173,7 +173,7 @@ fun SettingsScreen(
                 keyboardType = KeyboardType.Uri,
             )
 
-            // Camera (when the glasses camera runs)
+            // Camera (when the camera runs: glasses, and "Start on Phone" since v1.7.2)
             SectionHeader("Camera")
             ChoiceList(
                 options = listOf(
