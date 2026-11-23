@@ -279,12 +279,45 @@ def tts_mp3(text, voice):
         return None
 
 
+MIN_FREE_GB = 2.6   # the photo reader needs about 2 GB; below this it could push other apps out
+
+
+def free_memory_gb():
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1048576
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def unload(model):
+    """Ask Ollama to free a model's memory now."""
+    try:
+        body = json.dumps({"model": model, "keep_alive": 0}).encode()
+        req = urllib.request.Request(OLLAMA_URL.replace("/api/chat", "/api/generate"), data=body,
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=30).read()
+    except Exception:
+        pass
+
+
 def describe_photo(data_url):
-    """What the photo shows, from the local photo reader: (text, None) or (None, problem)."""
+    """What the photo shows, from the local photo reader: (text, None) or (None, problem).
+    Safe for the other apps (v2, 23 Nov): the chat model is unloaded first, the photo reader is
+    unloaded right after, its working memory is kept small, and nothing is loaded when the
+    phone is short of memory."""
+    unload(MODEL)
+    free = free_memory_gb()
+    if free is not None and free < MIN_FREE_GB:
+        print("photo refused: only %.1f GB memory free" % free)
+        return None, "the phone has only %.1f GB memory free, too little to read a photo safely right now" % free
     b64 = data_url.split(",", 1)[-1]
-    body = json.dumps({"model": VISION_MODEL, "stream": False,
+    body = json.dumps({"model": VISION_MODEL, "stream": False, "keep_alive": 0,
                        "messages": [{"role": "user", "content": PHOTO_PROMPT, "images": [b64]}],
-                       "options": {"num_thread": VISION_THREADS, "temperature": 0.2, "num_predict": 150}}).encode()
+                       "options": {"num_thread": VISION_THREADS, "num_ctx": 2048,
+                                   "temperature": 0.2, "num_predict": 150}}).encode()
     req = urllib.request.Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"})
     started = datetime.datetime.now()
     try:
@@ -297,8 +330,9 @@ def describe_photo(data_url):
     except Exception as e:
         return None, "the photo reader did not answer (" + type(e).__name__ + ")"
     secs = (datetime.datetime.now() - started).total_seconds()
-    print("photo read in %.1f s: %s pieces in %.1f s, %d cores" % (
-        secs, d.get("prompt_eval_count", "?"), d.get("prompt_eval_duration", 0) / 1e9, VISION_THREADS))
+    print("photo read in %.1f s: %s pieces in %.1f s, %d cores, %.1f GB free before" % (
+        secs, d.get("prompt_eval_count", "?"), d.get("prompt_eval_duration", 0) / 1e9, VISION_THREADS,
+        free if free is not None else -1))
     text = re.sub(r"\s+", " ", d.get("message", {}).get("content", "")).strip()
     return (text, None) if text else (None, "the photo reader gave no description")
 
